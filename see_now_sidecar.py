@@ -75,6 +75,11 @@ _RAW_SIZE = [0, 0]
 #: 这次抓的是哪块屏——它在虚拟桌面里的物理左上角。多屏时主屏不一定是 (0,0)，
 #: 坐标网格要靠它把图上像素换算回真实屏幕坐标。
 _SHOT_ORIGIN = [0, 0]
+# 抓屏范围：screen 按显示器设置抓整屏；window 只抓前台窗口那一块（窗口动，逐帧跟着走）。
+_TARGET = "screen"
+_WIN_SCREEN = None       # 窗口模式下用来夹边界的屏尺寸
+_WIN_FALLBACK = False    # 窗口没抓到、退回整屏时为 True，写进说明
+
 #: 这次要抓哪些显示器（dict 列表，空 = 用 ImageGrab 默认的主屏）。
 _MON_RECTS = []
 #: 整台机器上所有显示器，多屏时要拿未选中的那些去涂灰。
@@ -99,6 +104,7 @@ _BLOCK_CAP = 80
 
 DIFF_GRID = (320, 180)  # 算包围盒用的分辨率
 DIFF_LEVEL = 10.0       # 灰度差多少算「变了」
+_DIFF_LEVEL = DIFF_LEVEL # 运行时可调：包围盒阈值（配置 diff_level）
 CROP_PAD = 24           # 包围盒往外放宽多少像素（原图尺度）
 CROP_MAX = 0.55         # 变化区占全屏超过这个比例就不裁，不如整屏看
 #: 单帧裁切：变化区的宽或高窄到全屏的这个比例以下就不裁。面积小不代表形状能用——
@@ -145,6 +151,9 @@ def _grid(img: "Image.Image", step: int = 0,
     step 传 0 就按宽度自动挑：线太密看着糊，太疏又定不准位。
     origin / scale 用来把图上的像素换算回屏幕像素：图是缩过的，
     标屏幕坐标才有用——说「(1480, 320)」能直接拿去点，说「(460, 100)」没人知道是哪。
+    origin 是「图上 (0,0) 那一点对应的屏幕坐标」，所以换算就是 origin + 图上坐标 × scale。
+    以前写的是 (x - origin) × scale，只在 origin 恰好等于边框宽度、屏幕原点又是 0 时才对——
+    抓窗口、副屏、裁切这三种情况全都偏，等于刻度白标。
     """
     w, h = img.size
     if not step or step <= 0:
@@ -173,10 +182,10 @@ def _grid(img: "Image.Image", step: int = 0,
         font = ImageFont.load_default()
 
     def sx(x: int) -> int:
-        return int(round((x - origin[0]) * scale[0]))
+        return int(round(origin[0] + x * scale[0]))
 
     def sy(y: int) -> int:
-        return int(round((y - origin[1]) * scale[1]))
+        return int(round(origin[1] + y * scale[1]))
 
     def tag(x: int, y: int, text: str) -> None:
         box = draw.textbbox((x, y), text, font=font)
@@ -217,8 +226,31 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
     选了不止一块时抓整个虚拟桌面，未选中的区域涂成深灰——保留相对位置，
     坐标才换得回去（横排拼起来坐标就废了）。
     """
-    global _MON_MASK
+    global _MON_MASK, _WIN_FALLBACK, _APP_FALLBACK
     rects = _MON_RECTS
+    if _TARGET == "app":
+        hit = _pick_app()
+        if hit is not None:
+            got = _print_window(hit["hwnd"])
+            if got is not None:
+                img, org = got
+                _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = org
+                _RAW_SIZE[0], _RAW_SIZE[1] = img.size
+                small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR),
+                                   dtype=np.float32)
+                return img, small
+        # 没匹配到、或匹配到的都最小化了：退回整屏，别让整次调用失败。
+        _APP_FALLBACK = True
+    if _TARGET == "window":
+        box = _window_box(_WIN_SCREEN or _display_size(rects))
+        if box:
+            img = ImageGrab.grab(bbox=box)
+            _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = box[0], box[1]
+            _RAW_SIZE[0], _RAW_SIZE[1] = img.size
+            small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR), dtype=np.float32)
+            return img, small
+        # 窗口最小化、拿不到句柄：退回正常抓法，别让整次调用失败。
+        _WIN_FALLBACK = True
     if not rects:
         img = ImageGrab.grab()
         _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = 0, 0
@@ -355,7 +387,7 @@ def _changed_box(prev: Image.Image, cur: Image.Image):
         return None
     a = np.asarray(prev.convert("L").resize(DIFF_GRID, Image.BILINEAR), dtype=np.float32)
     b = np.asarray(cur.convert("L").resize(DIFF_GRID, Image.BILINEAR), dtype=np.float32)
-    mask = np.abs(a - b) > DIFF_LEVEL
+    mask = np.abs(a - b) > _DIFF_LEVEL
     if not mask.any():
         return None
     ys, xs = np.nonzero(mask)
@@ -530,7 +562,7 @@ def _dpi_scale(hwnd=None) -> float:
         dpi = 0
         if hwnd:
             try:
-                dpi = int(user32.GetDpiForWindow(ctypes.c_void_p(hwnd)) or 0)
+                dpi = int(user32.GetDpiForWindow(ctypes.c_void_p(int(hwnd))) or 0)
             except Exception:
                 dpi = 0
         if not dpi:
@@ -665,6 +697,244 @@ def _set_monitors(spec) -> list[dict]:
     return picked
 
 
+def _display_size(rects=None):
+    """这次能抓到的最大屏尺寸，给窗口框夹边界用。"""
+    if _ALL_MONS:
+        return (max(m["right"] for m in _ALL_MONS),
+                max(m["bottom"] for m in _ALL_MONS))
+    if rects:
+        return (rects[0]["w"], rects[0]["h"])
+    try:
+        return ImageGrab.grab().size
+    except Exception:
+        return (1920, 1080)
+
+
+# ---- 按名字抓窗口（target = app）----
+#: 这次匹配的串（进程名或窗口标题片段，不分大小写）。空 = 没填，抓不到就退回整屏。
+_APP_SPEC = ""
+#: 这次抓到的是哪个窗口，写进说明用。
+_APP_HIT = None
+#: 传了 app 却没抓到、退回整屏时为 True。
+_APP_FALLBACK = False
+#: 这次匹配到几个窗口。多个时取面积最大的那个。
+_APP_MATCHES = 0
+#: 匹配到的窗口里有几个是无响应的（IsHungAppWindow）。
+_APP_HUNG = 0
+
+
+def _proc_name(pid: int) -> str:
+    """pid 对应的可执行文件名（不带目录）；拿不到就空串。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(1024)
+        ok = k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size))
+        k32.CloseHandle(h)
+        if not ok:
+            return ""
+        return buf.value.replace("/", "\\").rsplit("\\", 1)[-1]
+    except Exception:
+        return ""
+
+
+def _app_list(spec: str) -> list[dict]:
+    """当前可见窗口里，标题或进程名含 spec 的那些。
+
+    进程名连 .exe 一起比，填「horizon-client」和「horizon-client.exe」都能中。
+    最小化的也列出来——抓不抓得到由调用方决定，不在这里静默丢掉。
+    """
+    out: list[dict] = []
+    if not spec or not sys.platform.startswith("win"):
+        return out
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u32 = ctypes.windll.user32
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, _lparam):
+            if not u32.IsWindowVisible(hwnd):
+                return True
+            n = u32.GetWindowTextLengthW(hwnd)
+            title = ""
+            if n:
+                b = ctypes.create_unicode_buffer(n + 1)
+                u32.GetWindowTextW(hwnd, b, n + 1)
+                title = b.value
+            pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            proc = _proc_name(pid.value)
+            if spec not in title.lower() and spec not in proc.lower():
+                return True
+            r = wintypes.RECT()
+            u32.GetWindowRect(hwnd, ctypes.byref(r))
+            out.append({
+                "hwnd": hwnd, "title": title, "proc": proc,
+                "iconic": bool(u32.IsIconic(hwnd)),
+                "hung": bool(u32.IsHungAppWindow(hwnd)),
+                "w": r.right - r.left, "h": r.bottom - r.top,
+            })
+            return True
+
+        u32.EnumWindows(_cb, 0)
+    except Exception:
+        return out
+    return out
+
+
+def _pick_app():
+    """挑这次要抓的那个窗口：非最小化、尺寸够大的里面面积最大的一个。
+
+    多个匹配是常事——同一个程序有主窗口、有提示条、有无形的 1x1 窗口。
+    取面积最大的，等于挑主窗口；提示条、透明窗口自然落选。
+    """
+    global _APP_HIT, _APP_MATCHES, _APP_HUNG
+    hits = _app_list(_APP_SPEC)
+    _APP_MATCHES = len(hits)
+    _APP_HUNG = len([h for h in hits if h.get("hung")])
+    # 无响应的跳过：PrintWindow 是同步发消息，对方不回就挂死整次抓屏。
+    usable = [h for h in hits
+              if not h["iconic"] and not h.get("hung")
+              and h["w"] >= 160 and h["h"] >= 120]
+    if not usable:
+        _APP_HIT = None
+        return None
+    usable.sort(key=lambda h: h["w"] * h["h"], reverse=True)
+    _APP_HIT = usable[0]
+    return _APP_HIT
+
+
+def _print_window(hwnd):
+    """把一个窗口连内容一起画到内存里，返回（PIL 图，原点 (l, t)）；拿不到返回 None。
+
+    和 ImageGrab 的区别：ImageGrab 抓屏幕上那块像素，窗口被别的窗口挡住时，
+    抓回来的就是挡住它的那个人。PrintWindow 让窗口自己画到内存 DC 上，
+    所以后台、被遮挡都能拿到真画面——实测被 Chrome 盖住的启动器、后台的
+    rust 版 MC（OpenGL）都能抓全。
+    最小化的拿不到：Windows 对最小化窗口只给任务栏那么大一个框。
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u32 = ctypes.windll.user32
+        g32 = ctypes.windll.gdi32
+        hwnd_int = int(hwnd)
+        hwnd = wintypes.HWND(hwnd_int)
+        if u32.IsIconic(hwnd):
+            return None
+        # 无响应的窗口不能碰：PrintWindow 会一直等它回消息。
+        if u32.IsHungAppWindow(hwnd):
+            return None
+        rect = wintypes.RECT()
+        if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        s = _dpi_scale(hwnd_int)
+        W = int(round((rect.right - rect.left) * s))
+        H = int(round((rect.bottom - rect.top) * s))
+        if W < 160 or H < 120:
+            return None
+
+        class _BMIH(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+
+        hdc = u32.GetWindowDC(hwnd)
+        if not hdc:
+            return None
+        mdc = g32.CreateCompatibleDC(hdc)
+        bmp = g32.CreateCompatibleBitmap(hdc, W, H)
+        old = g32.SelectObject(mdc, bmp)
+        try:
+            if not u32.PrintWindow(hwnd, mdc, 2):  # PW_RENDERFULLCONTENT
+                return None
+            bi = _BMIH()
+            bi.biSize = ctypes.sizeof(_BMIH)
+            bi.biWidth = W
+            bi.biHeight = -H  # 负数 = 从上到下，省一次翻转
+            bi.biPlanes = 1
+            bi.biBitCount = 32
+            buf = ctypes.create_string_buffer(W * H * 4)
+            if g32.GetDIBits(mdc, bmp, 0, H, buf, ctypes.byref(bi), 0) != H:
+                return None
+            img = Image.frombytes("RGB", (W, H), buf.raw[: W * H * 4], "raw", "BGRX")
+            return img, (int(round(rect.left * s)), int(round(rect.top * s)))
+        finally:
+            try:
+                g32.SelectObject(mdc, old)
+                g32.DeleteObject(bmp)
+                g32.DeleteDC(mdc)
+                u32.ReleaseDC(hwnd, hdc)
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+
+def _window_rect():
+    """前台窗口的物理像素矩形 (l, t, r, b)；拿不到就 None。
+
+    和 _foreground_box 的区别：那个要判「占屏多少」，超出区间就当没抓住；
+    这个不做区间判断——用户明确说了只看这个窗口，全屏窗口也该照抓。
+    最小化的窗口抓出来是空的，返回 None，由调用方退回整屏。
+    """
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        if user32.IsIconic(wintypes.HWND(hwnd)):
+            return None
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        _s = _dpi_scale(hwnd)
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if _s != 1.0:
+            left, top, right, bottom = (int(round(left * _s)), int(round(top * _s)),
+                                        int(round(right * _s)), int(round(bottom * _s)))
+        if right - left < 160 or bottom - top < 120:
+            return None
+        return (left, top, right, bottom)
+    except Exception:
+        return None
+
+
+def _window_box(screen_size):
+    """窗口矩形夹到屏内，给出抓屏用的 bbox；夹完太小就当没抓到。"""
+    rect = _window_rect()
+    if not rect:
+        return None
+    W, H = screen_size
+    left = max(0, min(W, rect[0]))
+    top = max(0, min(H, rect[1]))
+    right = max(0, min(W, rect[2]))
+    bottom = max(0, min(H, rect[3]))
+    if right - left < 160 or bottom - top < 120:
+        return None
+    return (left, top, right, bottom)
+
+
 def _foreground_box(screen_size):
     """取当前前台窗口在屏幕上的比例框；拿不到、或占屏超出 FG 区间，返回 None。
 
@@ -784,7 +1054,8 @@ def _cut_focus(img: Image.Image, box):
     return np.asarray(img.convert("RGB").crop((left, top, right, bottom)), dtype=np.float32)
 
 
-def _grab_run(seconds: float, max_frames: int, focus: str = "whole"):
+def _grab_run(seconds: float, max_frames: int, focus: str = "whole",
+              cut_abs: float = None, cut_peak: float = None, need: float = None):
     """抓一段，按判据留帧。返回（抓了多少帧，留下了哪些，最后那帧的原图）。
 
     一帧都没留下时，列表是空的，由调用方决定要不要复用上一张。
@@ -811,9 +1082,10 @@ def _grab_run(seconds: float, max_frames: int, focus: str = "whole"):
     # 就留一帧，视频那种缓慢流动才留得住。静止画面里顶多被光标和时钟勾一两帧，
     # 有 max_frames 兜着，不至于满盘。
     tracking = focus in ("content", "auto")
-    cut_abs = FOCUS_CUT_ABS if tracking else CUT_ABS
-    cut_peak = FOCUS_SPIKE if tracking else CUT_PEAK
-    need = FOCUS_NEED if tracking else NEED
+    # 三个阈值都可由配置覆盖；没给就按原样——认内容时压门槛，整屏时按突变判。
+    cut_abs = cut_abs if cut_abs is not None else (FOCUS_CUT_ABS if tracking else CUT_ABS)
+    cut_peak = cut_peak if cut_peak is not None else (FOCUS_SPIKE if tracking else CUT_PEAK)
+    need = need if need is not None else (FOCUS_NEED if tracking else NEED)
 
     while time.time() - t0 < seconds and len(frames) < max_frames:
         # 按节拍走，而不是「睡一觉再干活」——后者会把每帧的耗时也加进周期，
@@ -1181,7 +1453,37 @@ def _dump_pool(frames: list, shot_dir: str, cfg: dict, span: float) -> list:
 
 def run_once(cfg: dict) -> dict:
     """抓一段 → 留帧 → 装箱 / 裁变化区 → 可选认字 → 返回一份 JSON 用的字典。"""
+    global _TARGET, _DIFF_LEVEL, _WIN_FALLBACK, _WIN_SCREEN
+    global _APP_SPEC, _APP_FALLBACK, _APP_HIT, _APP_MATCHES, _APP_HUNG
     picked = _set_monitors(str(cfg.get("monitors") or "").strip())
+    _TARGET = str(cfg.get("target") or "screen").strip().lower()
+    if _TARGET not in ("screen", "window", "app"):
+        _TARGET = "screen"
+    _APP_SPEC = str(cfg.get("app") or "").strip().lower()
+    _APP_FALLBACK = False
+    _APP_HIT = None
+    _APP_MATCHES = 0
+    _APP_HUNG = 0
+    _WIN_FALLBACK = False
+    _WIN_SCREEN = None
+    if _TARGET == "window":
+        mons = _ALL_MONS or _monitors()
+        if mons:
+            _WIN_SCREEN = (max(m["right"] for m in mons) - min(m["left"] for m in mons),
+                           max(m["bottom"] for m in mons) - min(m["top"] for m in mons))
+    try:
+        _DIFF_LEVEL = float(cfg.get("diff_level"))
+    except (TypeError, ValueError):
+        _DIFF_LEVEL = DIFF_LEVEL
+    _DIFF_LEVEL = max(1.0, min(80.0, _DIFF_LEVEL))
+    def _num(name, lo, hi, fallback=None):
+        try:
+            v = float(cfg.get(name))
+        except (TypeError, ValueError):
+            return fallback
+        return max(lo, min(hi, v))
+    cut_abs_arg = _num("cut_abs", 1.0, 255.0)
+    need_arg = _num("need", 1.0, 2000.0)
     span = max(2.0, min(60.0, float(cfg.get("seconds") or 10.0)))
     cap = max(1, min(12, int(cfg.get("max_frames") or 6)))
     tier_lock = int(cfg.get("tier_lock") or 0)
@@ -1213,7 +1515,7 @@ def run_once(cfg: dict) -> dict:
 
     t_start = time.time()
     shots, frames, last_raw, diff_pair, focus_note = _grab_run(
-        span, cap, focus)
+        span, cap, focus, cut_abs=cut_abs_arg, need=need_arg)
 
     # 整段一帧都没留下，说明屏幕基本没动。
     # 这里原来把上一张原样递回去：省一次识图，但交出去的图带着上一次的时间戳，
@@ -1259,6 +1561,7 @@ def run_once(cfg: dict) -> dict:
         "elapsed_ms": int((time.time() - t_start) * 1000),
         "reused": False,
         "look": "",
+        "target": _TARGET,
         "monitors": {
             "picked": [m["n"] for m in _MON_RECTS],
             "count": len(_MON_RECTS) or 1,
@@ -1275,9 +1578,36 @@ def run_once(cfg: dict) -> dict:
     }
     if static_run:
         payload["static"] = True
-        payload["note"] = ("这段时间画面几乎没动，这是刚刚（%s）抓的一整屏，不是上一张旧图。"
-                           % time.strftime("%H:%M:%S"))
+        payload["note"] = ("这段时间画面几乎没动，这是刚刚（%s）抓的%s，不是上一张旧图。"
+                           % (time.strftime("%H:%M:%S"),
+                              "窗口那一块"
+                              if _TARGET == "app" and not _APP_FALLBACK
+                              else "前台窗口那一块"
+                              if _TARGET == "window" and not _WIN_FALLBACK
+                              else "一整屏"))
 
+    if _TARGET == "app":
+        if not _APP_FALLBACK and _APP_HIT:
+            payload["note"] += (" 这次只抓窗口《%s》（进程 %s，%d×%d）那一块，"
+                                "不在前台、被别的窗口挡着也照样抓得到。"
+                                % (_APP_HIT["title"] or "(无标题)", _APP_HIT["proc"],
+                                   _APP_HIT["w"], _APP_HIT["h"]))
+        else:
+            if _APP_MATCHES == 0:
+                _why = "没找到这个窗口"
+            elif _APP_HUNG >= _APP_MATCHES:
+                _why = "匹配到 %d 个，全都没响应（可能卡住了）" % _APP_MATCHES
+            elif _APP_HUNG > 0:
+                _why = ("匹配到 %d 个，其中 %d 个没响应、其余最小化了"
+                        % (_APP_MATCHES, _APP_HUNG))
+            else:
+                _why = "匹配到 %d 个，可能都最小化了" % _APP_MATCHES
+            payload["note"] += (" 想抓窗口「%s」但没抓到（%s），这次退回整屏。"
+                                % (_APP_SPEC or "没填匹配串", _why))
+    if _TARGET == "window":
+        payload["note"] += (" 这次只抓前台窗口那一块（不是整屏）。"
+                            if not _WIN_FALLBACK else
+                            " 想只抓前台窗口，但没拿到窗口框（可能最小化了），这次退回整屏。")
     if len(_MON_RECTS) > 1:
         payload["note"] += (" 这次抓了 %d 块屏（第 %s 块），没选中的那块涂了深灰，"
                             "保留相对位置好让坐标对得回去。"
@@ -1355,9 +1685,12 @@ def run_once(cfg: dict) -> dict:
                         scale = (bw / float(w), bh / float(h))
                     elif plan and plan.get("size"):
                         gw = 6  # _pack 里每格留的间隔
-                        origin = (gw + _SHOT_ORIGIN[0], gw + _SHOT_ORIGIN[1])
-                        scale = (_RAW_SIZE[0] / float(max(1, w - gw)),
-                                 _RAW_SIZE[1] / float(max(1, h - 2 * gw)))
+                        sc = (_RAW_SIZE[0] / float(max(1, w - gw)),
+                              _RAW_SIZE[1] / float(max(1, h - 2 * gw)))
+                        scale = sc
+                        # 图上 (gw,gw) 对应整幅的左上角，也就是 _SHOT_ORIGIN。
+                        origin = (_SHOT_ORIGIN[0] - gw * sc[0],
+                                  _SHOT_ORIGIN[1] - gw * sc[1])
                 framed, used = _grid(base, 0 if grid_step < 0 else grid_step, origin, scale)
             framed.save(path)
             payload["grid"] = {"step": used, "size": list(framed.size)}
@@ -1398,6 +1731,16 @@ def main(argv=None) -> int:
     ap.add_argument("--shot-dir", default="")
     ap.add_argument("--text-layer", action="store_true")
     ap.add_argument("--grid", default="0", help="坐标网格：0 关，auto 自动，或给像素步长")
+    ap.add_argument("--target", default="screen", choices=["screen", "window", "app"],
+                    help="screen 抓整屏 / window 只抓前台窗口那一块")
+    ap.add_argument("--app", default="",
+                    help="target=app 时按进程名或标题片段找窗口，不分大小写")
+    ap.add_argument("--diff-level", type=float, default=DIFF_LEVEL,
+                    help="灰度差多少算变了，1-80，默认 10")
+    ap.add_argument("--cut-abs", type=float, default=None,
+                    help="单帧突变门槛，不给按默认（整屏 12 / 认内容 2.5）")
+    ap.add_argument("--need", type=float, default=None,
+                    help="累计积分门槛，不给按默认（整屏 144 / 认内容 24）")
     ap.add_argument("--monitors", default="primary",
                     help="抓哪些显示器：primary 主屏 / all 全部 / 编号逗号分隔如 1,3")
     ap.add_argument("--keep-seconds", type=float, default=0.0,
@@ -1443,6 +1786,11 @@ def main(argv=None) -> int:
         "pool_max_files": a.pool_max_files,
         "pool_max_mb": a.pool_max_mb,
         "monitors": a.monitors,
+        "target": a.target,
+        "app": a.app,
+        "diff_level": a.diff_level,
+        "cut_abs": a.cut_abs,
+        "need": a.need,
 
     }
     try:
