@@ -721,6 +721,8 @@ _APP_FALLBACK = False
 _APP_MATCHES = 0
 #: 匹配到的窗口里有几个是无响应的（IsHungAppWindow）。
 _APP_HUNG = 0
+#: PrintWindow 拿回来的图几乎是单色（全黑、全白）时记下的原因；空串表示没这回事。
+_PRINT_BLANK = ""
 
 
 def _proc_name(pid: int) -> str:
@@ -821,6 +823,8 @@ def _print_window(hwnd):
     rust 版 MC（OpenGL）都能抓全。
     最小化的拿不到：Windows 对最小化窗口只给任务栏那么大一个框。
     """
+    global _PRINT_BLANK
+    _PRINT_BLANK = ""
     if not sys.platform.startswith("win"):
         return None
     try:
@@ -872,6 +876,13 @@ def _print_window(hwnd):
             if g32.GetDIBits(mdc, bmp, 0, H, buf, ctypes.byref(bi), 0) != H:
                 return None
             img = Image.frombytes("RGB", (W, H), buf.raw[: W * H * 4], "raw", "BGRX")
+            # 有些窗口 PrintWindow 报成功，harness 画出来却是一片单色（全黑/全白）。
+            # 当成抓到就会把一张空图送去识图，看着像「屏幕是黑的」。缩到 64×36 抽一下，差太小就退回。
+            probe = np.asarray(img.convert("RGB").resize((64, 36), Image.BILINEAR), dtype=np.int16)
+            if int(probe.max()) - int(probe.min()) < 8:
+                _PRINT_BLANK = "抓到的画面是一片单色（%s），这个窗口自己画不出内容" % (
+                    "全黑" if int(probe.max()) < 24 else "全是同一个颜色")
+                return None
             return img, (int(round(rect.left * s)), int(round(rect.top * s)))
         finally:
             try:
@@ -1593,7 +1604,9 @@ def run_once(cfg: dict) -> dict:
                                 % (_APP_HIT["title"] or "(无标题)", _APP_HIT["proc"],
                                    _APP_HIT["w"], _APP_HIT["h"]))
         else:
-            if _APP_MATCHES == 0:
+            if _PRINT_BLANK:
+                _why = _PRINT_BLANK
+            elif _APP_MATCHES == 0:
                 _why = "没找到这个窗口"
             elif _APP_HUNG >= _APP_MATCHES:
                 _why = "匹配到 %d 个，全都没响应（可能卡住了）" % _APP_MATCHES
@@ -1601,7 +1614,7 @@ def run_once(cfg: dict) -> dict:
                 _why = ("匹配到 %d 个，其中 %d 个没响应、其余最小化了"
                         % (_APP_MATCHES, _APP_HUNG))
             else:
-                _why = "匹配到 %d 个，可能都最小化了" % _APP_MATCHES
+                _why = "匹配到 %d 个，但都抓不到（最小化了，或者尺寸太小）" % _APP_MATCHES
             payload["note"] += (" 想抓窗口「%s」但没抓到（%s），这次退回整屏。"
                                 % (_APP_SPEC or "没填匹配串", _why))
     if _TARGET == "window":
