@@ -6,23 +6,32 @@
 
 ## 装
 
-1. 整个 `peek/` 目录放进 `plugins/`。
-2. 装依赖：
+**前提：这台机器上得有一个能跑的 Python 3。** 抓屏、算差分、裁图全在 Python 边车里，
+没有 Python 就不是"少个可选功能"，是整个工具跑不起来。
+
+Windows 商店那个 `python` 是占位别名——敲下去跳商店，不算装了。用 `python --version` 验证一下，
+输出 `Python was not found` 就是没有。
+
+1. 装 Python 3。实测 3.12 能用；3.9 以上应该都行，没逐个试。
+2. 整个 `peek/` 目录放进 `plugins/`。
+3. 装依赖（Pillow 抓图、numpy 算差分），用**上面那个解释器**跑：
    ```
-   pip install -r requirements.txt      # numpy + Pillow
+   pip install -r requirements.txt
    ```
+   `pip` 不在 PATH 里时，用解释器的完整路径：`"C:\...\python.exe" -m pip install -r requirements.txt`。
    Windows 上不需要 pywin32：Win32 调用走 ctypes。
-3. 识图模型，两级可以都配：
+4. 识图模型，两级可以都配：
    - **对话模型（默认一级）**：什么都不用装。只要 WhaleLife 里有一个能看图的对话模型，就用它。
    - **本地 Ollama（默认二级）**：`ollama pull qwen3-vl:4b`，把 `ollama_model` 填成这个模型名。
      本地不起眼的好处是不花 API 的钱，坏处是要占显存、还得让 Ollama 一直开着。
    - **不备用**：`vision_backup` 设成 `none`，一级失败就直接报错。
-4. **Python 解释器**。装出来的 `python` 不一定在 PATH 里（Windows 上可能只是商店的占位别名），三种指定方式，优先级从高到低：
+5. **Python 解释器**。装出来的 `python` 不一定在 PATH 里（Windows 上可能只是商店的占位别名），三种指定方式，优先级从高到低：
    - 插件数据目录下的 `data/config.json` 里的 `"python"` 字段，填解释器的完整路径
      （是 `plugins/peek/data/config.json`，不是 `plugins/peek/config.json`——插件配置一律在 `data/` 下，放错地方会被当成没有配置，静默退回 `python`）
    - 环境变量 `WHALELIFE_PEEK_PYTHON`
    - PATH 里的 `python`
-   前两个都不成立、`python` 又是占位别名时，工具会报错但说不出是解释器问题——先查这一项。
+   前两个都不成立、`python` 又是占位别名时，工具会直接说「没找到 Python 解释器」并把当前用的路径写出来；
+   设置页的「测试配置」还会额外提示「配置的路径不存在，已回落到 PATH 里的 python」。
 
 ## 帧缓存池
 
@@ -165,6 +174,9 @@
 
 已验证（本机实跑）：
 
+- **装进一个干净的 WhaleLife（v0.1.5）上跑通全链路**：插件加载 active、设置页 200、
+  「测试配置」七项全绿（Python 3.12.12 / 边车 / 依赖 Pillow 10.4.0 + numpy 2.2.6 / 识图 / Ollama / 出图目录），
+  再由对话里真调一次 `see_now`：抓 18 帧留 1 帧、出图、交给 gemini-3.1-flash-lite 描述成功
 - 边车单独跑：抓帧、判分、留帧、装箱、落盘，退出码 0
 - `numpy 2.2.6` / `Pillow 10.4.0` 下 `py_compile` 通过
 - `focus=whole` 与 `content` 两条分支的备注措辞来自实际输出
@@ -182,6 +194,8 @@
 - `tier_style` / `tier_lock` 没在改配置后实跑对比过，格子大小的效果是按代码算的
 - **多显示器只在单屏机器上验过**：编号解析（`primary` / `all` / `1,3` / `3,1` / 不存在编号回落主屏）、涂灰、非主屏的原点偏移，都是拿假矩形喂真函数测的；真插第二块屏没试过
 - 混合 DPI（两块屏缩放率不同）没处理：自校准只按主屏的比例算，副屏比例不同的话，那块会偏
+- **没有 Python 的机器没试过**：报错文案（「没找到 Python 解释器」）是按代码路径写的，没在一台真没装 Python 的机器上跑过
+- 换别的 Python 版本（3.9 / 3.10 / 3.13）没试，只在 3.12.12 上跑过
 
 ## 多显示器
 

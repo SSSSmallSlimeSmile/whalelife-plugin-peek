@@ -205,7 +205,8 @@ export function sanitize(input: any): Record<string, unknown> {
         out[key] = text.slice(0, 200);
         continue;
       }
-      const ok = (spec.options as readonly any[]).some((o) => (typeof o === "string" ? o : o.value) === text);
+      const list = (spec as any).options as readonly any[] | undefined;
+      const ok = Array.isArray(list) && list.some((o) => (typeof o === "string" ? o : o.value) === text);
       if (ok) out[key] = text;
     } else if (spec.kind === "line") {
       out[key] = String(value ?? "").trim().slice(0, 500);

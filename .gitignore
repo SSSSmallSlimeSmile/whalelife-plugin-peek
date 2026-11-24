@@ -3,3 +3,4 @@ shots/
 __pycache__/
 *.pyc
 .tmp/
+.tmp-*.json

@@ -158,6 +158,15 @@ function runSidecar(cfg: Config, seconds: number, maxFrames: number, maxWidth: n
         env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
       },
       (err, stdout, stderr) => {
+        if ((err as any)?.code === "ENOENT") {
+          const py = resolvePython(cfg.python);
+          fail(
+            new Error(
+              `没找到 Python 解释器（${py}）。装一个 Python 3，或在插件设置里填解释器的完整路径（data/config.json 的 python 字段），然后点「测试配置」。`,
+            ),
+          );
+          return;
+        }
         const out = String(stdout ?? "").trim();
         const line = out.split(/\r?\n/).filter((s) => s.trim().startsWith("{")).pop();
         if (line) {
@@ -293,8 +302,10 @@ async function describeChat(
   question: string,
 ): Promise<string> {
   const b64 = (await readFile(file)).toString("base64");
-  const ask = (noThink: boolean) =>
-    ctx.llm.chat({
+  const ask = (noThink: boolean) => {
+    // parameters 不在 ChatOptions 的类型里，但宿主会把它原样透传给服务商；
+    // 有的 openai 兼容端点（Gemini）见 "thinking" 就整个 400，所以按需带、按需去。
+    const opts: any = {
       model: modelId,
       messages: [
         {
@@ -306,9 +317,11 @@ async function describeChat(
         },
       ],
       max_tokens: cfg.vision_max_tokens,
-      parameters: noThink ? { thinking: { type: "disabled" } } : undefined,
       signal: AbortSignal.timeout(cfg.vision_timeout_ms),
-    });
+    };
+    if (noThink) opts.parameters = { thinking: { type: "disabled" } };
+    return ctx.llm.chat(opts);
+  };
   // 有的服务商的 openai 兼容端点不认 thinking 字段，见到就整个请求 400。
   // 只在这一种情况下退一步重试，别的错误不吞。
   let reply: any;
@@ -627,12 +640,19 @@ export async function apply(ctx: Context) {
 
       // 1. python 起不起得来
       const py = resolvePython(cfg.python);
+      const wantPy = String(cfg.python ?? "").trim();
+      if (wantPy && !existsSync(wantPy))
+        lines.push(`[!] 配置的 python 路径不存在：${wantPy}，已回落到 PATH 里的 python`);
+      let pyOk = false;
       try {
         const out = spawnSync(py, ["-c", "import sys; print(sys.version.split()[0])"], { timeout: 15000, encoding: "utf8" });
         if (out.error || out.status !== 0) {
           ok = false;
           lines.push(`[×] Python：${py} 调不动 —— ${out.error?.message ?? String(out.stderr ?? "").trim() ?? ("退出码 " + out.status)}`);
+          // 后面那条依赖检查没有意义，python 都起不来
+          lines.push("    装一个 Python 3，或在插件设置里填解释器的完整路径（python 字段）；Windows 商店那个 python 别名不算。");
         } else {
+          pyOk = true;
           lines.push(`[✓] Python ${String(out.stdout ?? "").trim()}：${py}`);
         }
       } catch (error: any) {
@@ -644,6 +664,25 @@ export async function apply(ctx: Context) {
       const script = resolve(cfg.script);
       if (existsSync(script)) lines.push(`[✓] 边车脚本：${script}`);
       else { ok = false; lines.push(`[×] 边车脚本不在：${script}`); }
+
+      // 2b. 依赖：Pillow 抓图、numpy 算差分（python 起不来就不查，免得同一条错报两遍）
+      if (pyOk) try {
+        const dep = spawnSync(py, ["-c", "import PIL, numpy; print(PIL.__version__, numpy.__version__)"], {
+          timeout: 20000,
+          encoding: "utf8",
+        });
+        if (dep.error || dep.status !== 0) {
+          ok = false;
+          const why = String(dep.stderr ?? "").trim().split(/\r?\n/).slice(-1)[0] || dep.error?.message || ("退出码 " + dep.status);
+          lines.push(`[×] 缺依赖 Pillow / numpy —— ${why}`);
+          lines.push("    在插件的 see_now_sidecar.py 所在目录跑一句：pip install -r requirements.txt");
+        } else {
+          lines.push(`[✓] 依赖：Pillow ${String(dep.stdout ?? "").trim()}`);
+        }
+      } catch (error: any) {
+        ok = false;
+        lines.push(`[×] 依赖检查没跑成 —— ${error?.message ?? error}`);
+      }
 
       // 3. 识图这两级各落到谁身上
       const chain = buildChain(ctx, cfg, null);
