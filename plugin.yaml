@@ -1,6 +1,6 @@
 id: peek
 name: 看屏
 description: 抓一段时间里的屏幕变化，只留真正变了的帧拼成一张图，交给识图模型说一遍。看的是过程，不是当前这一帧
-version: 0.1.4
+version: 0.1.5
 apiVersion: "1.0.0"
 depends: [web, tools]
