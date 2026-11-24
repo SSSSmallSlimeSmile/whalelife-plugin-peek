@@ -1,0 +1,11 @@
+peek · 看屏
+Copyright 2026 SSSSmallSlimeSmile
+
+本插件改自 SAOS-3624/dsh-see-now（Apache License 2.0）。
+原始版权归其作者所有；修改部分同样按 Apache License 2.0 授权。
+
+相对上游的改动：按画面变化取帧、前台窗口优先裁区、清晰度分档与锁档、
+max_width、配置页、三级解释器查找、识图分两级（对话模型与本地 Ollama）、
+坐标网格（刻度为屏幕像素）、显示器选择、帧缓存池、多帧角标。
+
+Apache License 2.0 全文见 LICENSE。

@@ -1,0 +1,5 @@
+data/
+shots/
+__pycache__/
+*.pyc
+.tmp/
