@@ -34,6 +34,19 @@ const DEFAULTS = {
   tier_lock: 0,
   /** whole / content / auto —— auto 先整屏抓，热点占屏 8%-60% 才裁。 */
   focus: "auto",
+  /**
+   * screen 按显示器设置抓整屏；window 只抓前台窗口那一块（窗口动静逐帧跟）；
+   * app 按进程名或标题抓指定窗口，后台、被遮挡也能抓。
+   */
+  target: "screen",
+  /** target=app 时匹配的串：进程名（可带 .exe）或窗口标题片段，不分大小写。 */
+  app: "",
+  /** 包围盒阈值：灰度差多少算「变了」，1-80，默认 10。 */
+  diff_level: 10,
+  /** 单帧突变门槛，0 = 用默认（整屏 12 / 认内容 2.5）。 */
+  cut_abs: 0,
+  /** 累计积分门槛，0 = 用默认（整屏 144 / 认内容 24）。 */
+  need: 0,
   /** 成品图与单帧裁切图的最大宽度，400-4096。 */
   max_width: 1600,
   /** 坐标网格：0 关，auto 自动步长，或直接给像素步长。只叠在单帧上。 */
@@ -95,6 +108,7 @@ type SidecarResult = {
   tier?: string;
   static?: boolean;
   grid?: { step?: number; size?: number[] };
+  target?: string;
   monitors?: {
     picked?: number[];
     count?: number;
@@ -132,6 +146,11 @@ function runSidecar(cfg: Config, seconds: number, maxFrames: number, maxWidth: n
     "--tier-style", String(cfg.tier_style),
     "--tier-lock", String(cfg.tier_lock),
     "--focus", String(cfg.focus),
+    "--target", String(cfg.target ?? "screen"),
+    ...(String(cfg.app ?? "").trim() ? ["--app", String(cfg.app).trim()] : []),
+    ...(Number(cfg.diff_level) > 0 ? ["--diff-level", String(cfg.diff_level)] : []),
+    ...(Number(cfg.cut_abs) > 0 ? ["--cut-abs", String(cfg.cut_abs)] : []),
+    ...(Number(cfg.need) > 0 ? ["--need", String(cfg.need)] : []),
     "--max-width", String(maxWidth),
     "--shot-dir", String(cfg.shot_dir),
   ];
@@ -523,6 +542,18 @@ export async function apply(ctx: Context) {
           type: "string",
           description: "抓哪几块屏：primary（默认，主屏）、all（全部）、或编号逗号分隔如 1,3。只在多显示器时有区别",
         },
+        target: {
+          type: "string",
+          description:
+            "抓屏范围：screen（默认，整屏）、window（只抓前台窗口那一块，窗口移动会跟着走）、" +
+            "app（按进程名或标题抓指定窗口，不在前台、被别的窗口挡着也能抓到）",
+        },
+        app: {
+          type: "string",
+          description:
+            "target=app 时抓哪个窗口：进程名（如 horizon-client、chrome.exe）或窗口标题的一段，不分大小写。" +
+            "匹配到多个时取面积最大的那个",
+        },
         question: { type: "string", description: "想重点看什么，可省略" },
       },
       required: [],
@@ -547,12 +578,20 @@ export async function apply(ctx: Context) {
         args?.monitors !== undefined && args?.monitors !== null && String(args.monitors).trim() !== ""
           ? String(args.monitors).trim()
           : String(cfg.monitors ?? DEFAULTS.monitors);
+      const targetArg =
+        args?.target !== undefined && args?.target !== null && String(args.target).trim() !== ""
+          ? String(args.target).trim().toLowerCase()
+          : String(cfg.target ?? DEFAULTS.target);
+      const appArg =
+        args?.app !== undefined && args?.app !== null && String(args.app).trim() !== ""
+          ? String(args.app).trim()
+          : String(cfg.app ?? DEFAULTS.app);
       await reload();
 
       let data: SidecarResult;
       try {
         data = await runSidecar(
-          { ...cfg, grid: gridArg, pool_ttl: poolArg, monitors: monitorsArg },
+          { ...cfg, grid: gridArg, pool_ttl: poolArg, monitors: monitorsArg, target: targetArg, app: appArg },
           seconds, maxFrames, maxWidth);
       } catch (error: any) {
         return `错误：${error?.message ?? String(error)}`;
@@ -564,10 +603,17 @@ export async function apply(ctx: Context) {
         mon && (mon.count ?? 0) > 1
           ? `屏：第 ${(mon.picked ?? []).join("、")} 块（共 ${mon.count} 块）`
           : "";
+      const scopeLine =
+        data.target === "window"
+          ? "范围：前台窗口"
+          : data.target === "app"
+            ? `范围：窗口 ${appArg || "（没填匹配串）"}`
+            : "";
       const head = [
         `抓 ${data.shot_frames ?? 0} 帧，留 ${data.kept_frames ?? 0} 帧，${data.seconds ?? seconds} 秒`,
         data.tier ? `档位：${data.tier}` : "",
         monLine,
+        scopeLine,
       ]
         .filter(Boolean)
         .join("｜");

@@ -36,6 +36,36 @@ const FIELDS = {
     ],
     hint: "自动：先看前台窗口，把变化最集中的一块裁出来；窗口占满全屏、或画面到处在动时退回整屏。只送内容区：强制按变化区裁。整屏不裁：什么都看得到，但一半格子花在标题栏和任务栏上。",
   },
+  target: {
+    kind: "select",
+    label: "抓屏范围",
+    options: [
+      { value: "screen", label: "整屏（按显示器设置）" },
+      { value: "window", label: "只抓前台窗口那一块" },
+      { value: "app", label: "只抓指定窗口（进程名或标题）" },
+    ],
+    hint: "整屏：抓下整块屏幕，坐标就是屏幕像素，适合问「屏幕上有什么」。只抓前台窗口：只抓当前带焦点的那一个窗口，窗口移动、缩放会逐帧跟着走，旁边的东西不进图。只抓指定窗口：按下面那栏填的名字找窗口，后台、被别的窗口挡着也能抓到（游戏、播放器都行），窗口最小化时抓不到、会退回整屏。两种指定方式拿不到窗口时都会退回整屏，回执里写明这次退回了。",
+  },
+  app: {
+    kind: "line",
+    label: "抓哪个窗口（进程名或标题片段）",
+    hint: "只在上面选了「只抓指定窗口」时起作用。填进程名或窗口标题的一段，不分大小写，比如 horizon-client、chrome、ChatGPT。可以用任务管理器「详细信息」里那个名字；标题就照标题栏抄一段。匹配到多个窗口时取面积最大的那个（主窗口）。",
+  },
+  diff_level: {
+    kind: "number", min: 1, max: 80,
+    label: "变化阈值（灰度差，默认 10）",
+    hint: "本地比两帧时，灰度差超过这个数才算「变了」。调小更敏感，光标闪一下也算；调大更钝，只认明显改动。它决定「哪块变了」，不决定留多少帧——那是下面两项的事。",
+  },
+  cut_abs: {
+    kind: "number", min: 0, max: 255,
+    label: "单帧突变门槛（0 = 按默认）",
+    hint: "一帧变化分超过它就当成「画面一下子换了」直接留。整屏默认 12，认得内容区时默认 2.5。调高只留激烈变化，调低连轻微闪动也留。填 0 用默认。",
+  },
+  need: {
+    kind: "number", min: 0, max: 2000,
+    label: "累计积分门槛（0 = 按默认）",
+    hint: "变化一点点积累时，攒够这个分才留一帧。整屏默认 144，认得内容区时默认 24。视频那种缓慢流动靠它才留得住。填 0 用默认。",
+  },
   tier_style: {
     kind: "select",
     label: "清晰度偏移",
@@ -233,13 +263,13 @@ const GROUPS: GroupSpec[] = [
     id: "capture",
     title: "抓屏",
     desc: "一次看屏抓多久、抓几帧、看整屏还是只看一块。这三样决定你看到的是「多久之内发生了什么」和「多大范围里的事」。默认值够日常用，视频、动效多的场景才往上调。",
-    keys: ["seconds", "max_frames", "max_width", "focus", "text_layer"],
+    keys: ["seconds", "max_frames", "max_width", "focus", "target", "app", "text_layer"],
   },
   {
     id: "sharp",
     title: "清晰度与坐标",
     desc: "帧怎么排、每一格多清楚；以及那条红刻度——刻度上的数字是屏幕像素坐标，可以直接照着说位置，也可以拿去裁。画面变化快时会自动缩小格子、塞更多帧，这页可以强制它偏一侧。",
-    keys: ["tier_style", "tier_lock", "grid", "crop_min_side_pct", "crop_max_h", "monitors"],
+    keys: ["tier_style", "tier_lock", "diff_level", "cut_abs", "need", "grid", "crop_min_side_pct", "crop_max_h", "monitors"],
   },
   {
     id: "disk",
