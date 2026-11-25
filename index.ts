@@ -856,13 +856,19 @@ export async function apply(ctx: Context) {
     { title: "看屏", navigation: true },
   );
 
+  // 同一插件实例内，上一笔写完才读下一笔要合并的配置。
+  let pendingSave = Promise.resolve();
   ctx.web.api("/plugins/peek/save", async (req, res) => {
     try {
       const patchIn = sanitize(await readBody(req));
       const keys = Object.keys(patchIn);
       if (!keys.length) throw new Error("没有可保存的字段");
-      const merged = { ...(await ctx.config.read<any>("config.json").catch(() => null)), ...patchIn };
-      await ctx.config.save("config.json", merged);
+      const save = pendingSave.then(async () => {
+        const current = await ctx.config.read<Record<string, unknown>>("config.json");
+        await ctx.config.save("config.json", { ...current, ...patchIn });
+      });
+      pendingSave = save.catch(() => {});
+      await save;
       res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
       res.end(JSON.stringify({ ok: true, saved: keys }));
     } catch (error: any) {

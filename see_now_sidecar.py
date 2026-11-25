@@ -82,6 +82,7 @@ _WIN_SCREEN = None       # 窗口模式下用来夹边界的屏尺寸
 #: 显示器坐标没校准好时的说明；空串表示没这回事。写进回执，不静默。
 _CALIB_NOTE = ""
 _WIN_FALLBACK = False    # 窗口没抓到、退回整屏时为 True，写进说明
+_SHOT_FALLBACK = False   # 只记录最近一帧是否退回整屏
 #: 抓不到指定窗口时，允不允许悄悄换成一整屏。默认 False：
 #: 用户点的是「抓这个窗口」，换范围等于把没被要求看的东西也交出去。
 _FALLBACK_ON_MISS = False
@@ -250,7 +251,8 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
     选了不止一块时抓整个虚拟桌面，未选中的区域涂成深灰——保留相对位置，
     坐标才换得回去（横排拼起来坐标就废了）。
     """
-    global _MON_MASK, _WIN_FALLBACK, _APP_FALLBACK
+    global _MON_MASK, _WIN_FALLBACK, _APP_FALLBACK, _SHOT_FALLBACK
+    _SHOT_FALLBACK = False
     rects = _MON_RECTS
     if _TARGET == "app":
         hit = _pick_app()
@@ -293,6 +295,7 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
             if not _FALLBACK_ON_MISS:
                 raise TargetMiss("拿不到前台窗口的框（可能最小化了）")
             _WIN_FALLBACK = True
+    _SHOT_FALLBACK = _TARGET in ("window", "app")
     if not rects:
         img = ImageGrab.grab()
         _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = 0, 0
@@ -996,12 +999,14 @@ _WIN_TRACE = {"hwnd": 0, "rect": None, "id": None}
 
 
 def _current_target_identity():
-    """这一轮的图属于哪个窗口。整屏档没有「某个窗口」这回事，返回 None。"""
+    """最近一帧的窗口句柄和身份。整屏图没有对应窗口。"""
+    if _SHOT_FALLBACK:
+        return 0, None
     if _TARGET == "window":
-        return _WIN_TRACE.get("id")
-    if _TARGET == "app":
-        return (_APP_HIT or {}).get("id")
-    return None
+        return _WIN_TRACE["hwnd"], _WIN_TRACE["id"]
+    if _TARGET == "app" and _APP_HIT:
+        return _APP_HIT["hwnd"], _APP_HIT.get("id")
+    return 0, None
 
 
 def _window_rect():
@@ -1095,6 +1100,9 @@ def _ident_label(ident) -> str:
         return "《%s》 pid %d" % (title, pid) if pid else "《%s》" % title
     if pid:
         return "pid %d 的无标题窗口" % pid
+    cls = str(ident.get("cls") or "").strip()
+    if cls:
+        return "类名 %s 的无标题窗口" % cls
     return "(没有身份)"
 
 
@@ -1891,18 +1899,24 @@ def run_once(cfg: dict) -> dict:
         # 补拍的这一张是「现在」的，窗口身份得跟着现在的那一刻走。
         # 以前只在补拍后刷新身份：中间前台换了人，新窗口就用自己的身份
         # 给自己那张图作证，图和控件对不上也没人发现。
-        need_ident = _TARGET in ("window", "app")
-        id_before = _current_target_identity() if need_ident else None
+        hwnd_before, id_before = _current_target_identity()
         try:
             img, _ = _shot()
         except TargetMiss as exc:
             return _blocked_payload(str(exc), t_start)
-        id_after = _current_target_identity() if need_ident else None
-        if id_before and id_after and not _identity_same(id_before, id_after):
-            return _blocked_payload(
-                "补拍这一张的时候目标窗口换了（%s → %s），图和窗口对不上"
-                % (_ident_label(id_before), _ident_label(id_after)), t_start)
+        if _TARGET in ("window", "app") and not _SHOT_FALLBACK:
+            hwnd_after, id_after = _current_target_identity()
+            if (not hwnd_before or hwnd_before != hwnd_after
+                    or not _identity_same(id_before, id_after)):
+                return _blocked_payload(
+                    "补拍前后无法确认是同一个窗口（%s，句柄 %s → %s，句柄 %s）"
+                    % (_ident_label(id_before), hwnd_before or "未知",
+                       _ident_label(id_after), hwnd_after or "未知"), t_start)
+        # 整段没有留帧，回执和文字层以补拍图的来源为准。
+        _APP_FALLBACK = _TARGET == "app" and _SHOT_FALLBACK
+        _WIN_FALLBACK = _TARGET == "window" and _SHOT_FALLBACK
         frames = [(_big(img), CUT_ABS)]
+        last_raw = img
         static_run = True
         # 补拍拿的是刚抓的一张，上一轮那对差分帧已经过期。
         # 留着它，下面「只留一帧就裁变化区」会去裁一张旧图，配的却是新图的身份。

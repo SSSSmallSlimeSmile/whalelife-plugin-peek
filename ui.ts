@@ -425,7 +425,7 @@ export function renderPage(cfg: any, chatModels: ChatModelOption[] = [], warning
 .pg-result.wait{background:rgba(124,92,255,.10);border-color:rgba(124,92,255,.35);color:#6d4aff}
 .pg-result.ok{background:rgba(5,150,105,.10);border-color:rgba(5,150,105,.35);color:#047857}
 .pg-result.err{background:rgba(220,38,38,.10);border-color:rgba(220,38,38,.35);color:#b91c1c}
-#msg{display:none}
+#msg:empty{display:none}
 @media(max-width:760px){.panel-body .pg-pair{grid-template-columns:1fr}}
 </style></head><body>
 <form id="f">
@@ -462,18 +462,28 @@ const goto = (id) => {
 for (const t of tabs) t.addEventListener("click", () => goto(t.getAttribute("data-goto")));
 form.addEventListener("change", syncDeps);
 syncDeps();
+const fieldValue = (el) => el.type === "checkbox" ? el.checked : el.value;
+const savedValues = new Map([...form.elements].filter((el) => el.name)
+  .map((el) => [el.name, fieldValue(el)]));
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   const data = {};
   for (const el of form.elements) {
     if (!el.name) continue;
-    data[el.name] = el.type === "checkbox" ? el.checked : el.value;
+    const value = fieldValue(el);
+    if (value !== savedValues.get(el.name)) data[el.name] = value;
   }
-  ok.disabled = true; msg.className = ""; msg.textContent = "保存中…";
+  msg.className = "";
+  if (!Object.keys(data).length) {
+    msg.textContent = "没有改动";
+    return;
+  }
+  ok.disabled = true; msg.textContent = "保存中…";
   try {
     const res = await fetch("/plugins/peek/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || ("HTTP " + res.status));
+    for (const key of body.saved ?? []) savedValues.set(key, data[key]);
     msg.textContent = "已保存，下次调用生效";
   } catch (error) {
     msg.className = "err";
