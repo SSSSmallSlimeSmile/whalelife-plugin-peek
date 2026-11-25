@@ -79,6 +79,13 @@ _SHOT_ORIGIN = [0, 0]
 _TARGET = "screen"
 _WIN_SCREEN = None       # 窗口模式下用来夹边界的屏尺寸
 _WIN_FALLBACK = False    # 窗口没抓到、退回整屏时为 True，写进说明
+#: 抓不到指定窗口时，允不允许悄悄换成一整屏。默认 False：
+#: 用户点的是「抓这个窗口」，换范围等于把没被要求看的东西也交出去。
+_FALLBACK_ON_MISS = False
+
+
+class TargetMiss(Exception):
+    """指定的窗口没抓到。抓不到就停，由 run_once 转成 blocked 回执。"""
 
 #: 这次要抓哪些显示器（dict 列表，空 = 用 ImageGrab 默认的主屏）。
 _MON_RECTS = []
@@ -215,6 +222,20 @@ def _grid(img: "Image.Image", step: int = 0,
     return out, step
 
 
+def _app_miss_reason() -> str:
+    """抓不到指定窗口时，说清是哪一种。"""
+    if _PRINT_BLANK:
+        return _PRINT_BLANK
+    if _APP_MATCHES == 0:
+        return "没找到这个窗口"
+    if _APP_HUNG >= _APP_MATCHES:
+        return "匹配到 %d 个，全都没响应（可能卡住了）" % _APP_MATCHES
+    if _APP_HUNG > 0:
+        return ("匹配到 %d 个，其中 %d 个没响应、其余最小化了"
+                % (_APP_MATCHES, _APP_HUNG))
+    return "匹配到 %d 个，但都抓不到（最小化了，或者尺寸太小）" % _APP_MATCHES
+
+
 def _shot() -> tuple[Image.Image, np.ndarray]:
     """一次抓屏，出两份：原图留着备取，小图拿去判分。
 
@@ -239,7 +260,10 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
                 small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR),
                                    dtype=np.float32)
                 return img, small
-        # 没匹配到、或匹配到的都最小化了：退回整屏，别让整次调用失败。
+        # 没匹配到、或匹配到的都最小化了：默认就停在这儿。
+        if not _FALLBACK_ON_MISS:
+            raise TargetMiss("窗口「%s」抓不到：%s"
+                             % (_APP_SPEC or "（没填匹配串）", _app_miss_reason()))
         _APP_FALLBACK = True
     if _TARGET == "window":
         box = _window_box(_WIN_SCREEN or _display_size(rects))
@@ -249,7 +273,9 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
             _RAW_SIZE[0], _RAW_SIZE[1] = img.size
             small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR), dtype=np.float32)
             return img, small
-        # 窗口最小化、拿不到句柄：退回正常抓法，别让整次调用失败。
+        # 窗口最小化、拿不到句柄。
+        if not _FALLBACK_ON_MISS:
+            raise TargetMiss("拿不到前台窗口的框（可能最小化了）")
         _WIN_FALLBACK = True
     if not rects:
         img = ImageGrab.grab()
@@ -1341,29 +1367,72 @@ def _save_last(shot_dir: str, payload: dict) -> None:
         logger.warning("[see_now] 快照记不住：%s: %s", type(exc).__name__, exc)
 
 
+#: 本插件写的文件清单，跟图放在同一个目录里。
+#: 目录是用户可以填的（shot_dir / pool_dir 都能指到任意路径），
+#: 按「.png 结尾」乱删等于把别人目录里的图一起清掉。所以每次写都记一笔，
+#: 清理只认这份清单——不是自己写的，一个字节都不动。
+_OWNED_NAME = "see_now-owned.json"
+
+
+def _owned_load(d: str) -> set:
+    try:
+        with open(os.path.join(d, _OWNED_NAME), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    files = data.get("files") if isinstance(data, dict) else None
+    return set(str(x) for x in files) if isinstance(files, list) else set()
+
+
+def _owned_save(d: str, names: set) -> None:
+    path = os.path.join(d, _OWNED_NAME)
+    try:
+        tmp = path + ".part"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"files": sorted(names)}, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("[see_now] 清单写不进去：%s: %s", type(exc).__name__, exc)
+
+
+def _owned_add(d: str, name: str) -> None:
+    if not name:
+        return
+    s = _owned_load(d)
+    if name in s:
+        return
+    s.add(name)
+    _owned_save(d, s)
+
+
 def _sweep_old_shots(shot_dir: str, seconds: float = 0) -> None:
-    """写入新图之前先扫一遍，把超过几秒的老截图清掉。只删 .png。
+    """写入新图之前先扫一遍，把超过几秒的老截图清掉。只删自己写的。
 
     seconds <= 0 表示不长期留：本次这张图照样出，但旧的全清掉，
     下次抓屏时本次这张也会被清（隐私上是「只留最近一张」）。
     """
+    owned = _owned_load(shot_dir)
+    if not owned:
+        return
     if seconds is None or seconds <= 0:
         cutoff = time.time()
     else:
         cutoff = time.time() - seconds
-    try:
-        names = os.listdir(shot_dir)
-    except OSError:
-        return
-    for name in names:
-        if not name.lower().endswith(".png"):
-            continue
+    kept = set()
+    for name in owned:
         fp = os.path.join(shot_dir, name)
         try:
-            if os.path.getmtime(fp) < cutoff:
-                os.remove(fp)
+            st = os.stat(fp)
         except OSError:
-            pass
+            continue                      # 已经不在磁盘上了，从清单里剔掉
+        if st.st_mtime < cutoff:
+            try:
+                os.remove(fp)
+            except OSError:
+                kept.add(name)            # 删不掉就留着，下次再试
+        else:
+            kept.add(name)
+    _owned_save(shot_dir, kept)
 
 
 def _pool_dir_of(shot_dir: str, cfg: dict) -> str:
@@ -1372,14 +1441,13 @@ def _pool_dir_of(shot_dir: str, cfg: dict) -> str:
 
 
 def _sweep_pool(pdir: str, ttl: float, max_files: int, max_mb: float) -> None:
-    """缓存池清理：先按时间清，再按张数、体积从最旧的开始删。"""
-    try:
-        names = [n for n in os.listdir(pdir) if n.lower().endswith(".png")]
-    except OSError:
+    """缓存池清理：先按时间清，再按张数、体积从最旧的开始删。只删自己写的。"""
+    owned = _owned_load(pdir)
+    if not owned:
         return
     items = []
     now = time.time()
-    for n in names:
+    for n in owned:
         fp = os.path.join(pdir, n)
         try:
             st = os.stat(fp)
@@ -1410,6 +1478,7 @@ def _sweep_pool(pdir: str, ttl: float, max_files: int, max_mb: float) -> None:
                 total -= s
             except OSError:
                 pass
+    _owned_save(pdir, set(os.path.basename(_fp) for _m, _s, _fp in items))
 
 
 def _dump_pool(frames: list, shot_dir: str, cfg: dict, span: float) -> list:
@@ -1444,10 +1513,12 @@ def _dump_pool(frames: list, shot_dir: str, cfg: dict, span: float) -> list:
     n = len(frames)
     for i, item in enumerate(frames):
         arr, score = item[0], item[1]
-        fp = os.path.join(pdir, "%s_f%02d.png" % (stamp, i + 1))
+        fname = "see_now_%s_f%02d.png" % (stamp, i + 1)
+        fp = os.path.join(pdir, fname)
         try:
             im = Image.fromarray(np.ascontiguousarray(arr.astype(np.uint8)))
             im.save(fp)
+            _owned_add(pdir, fname)
         except Exception as exc:
             logger.warning("[see_now] 这一帧没存进池：%s: %s", type(exc).__name__, exc)
             continue
@@ -1462,15 +1533,31 @@ def _dump_pool(frames: list, shot_dir: str, cfg: dict, span: float) -> list:
     return [o for o in out if os.path.exists(o["file"])]
 
 
+def _blocked_payload(reason: str, t0: float) -> dict:
+    """抓不到目标时的回执：明确说没抓到，不给图，也不假装换了范围。"""
+    return {
+        "status": "blocked",
+        "reason": reason,
+        "target": _TARGET,
+        "app": _APP_SPEC,
+        "elapsed_ms": int((time.time() - t0) * 1000),
+        "note": "没有出图：这次要抓的目标窗口没抓到（%s）。"
+                "没退回整屏——那会把没被要求看的东西也一起交出去。"
+                "要允许退回，在设置里打开「抓不到就退回整屏」。" % reason,
+    }
+
+
 def run_once(cfg: dict) -> dict:
     """抓一段 → 留帧 → 装箱 / 裁变化区 → 可选认字 → 返回一份 JSON 用的字典。"""
     global _TARGET, _DIFF_LEVEL, _WIN_FALLBACK, _WIN_SCREEN
     global _APP_SPEC, _APP_FALLBACK, _APP_HIT, _APP_MATCHES, _APP_HUNG
+    global _FALLBACK_ON_MISS
     picked = _set_monitors(str(cfg.get("monitors") or "").strip())
     _TARGET = str(cfg.get("target") or "screen").strip().lower()
     if _TARGET not in ("screen", "window", "app"):
         _TARGET = "screen"
     _APP_SPEC = str(cfg.get("app") or "").strip().lower()
+    _FALLBACK_ON_MISS = bool(cfg.get("fallback_on_miss"))
     _APP_FALLBACK = False
     _APP_HIT = None
     _APP_MATCHES = 0
@@ -1525,15 +1612,21 @@ def run_once(cfg: dict) -> dict:
     cap = min(cap, _frame_limit(tier_lock))
 
     t_start = time.time()
-    shots, frames, last_raw, diff_pair, focus_note = _grab_run(
-        span, cap, focus, cut_abs=cut_abs_arg, need=need_arg)
+    try:
+        shots, frames, last_raw, diff_pair, focus_note = _grab_run(
+            span, cap, focus, cut_abs=cut_abs_arg, need=need_arg)
+    except TargetMiss as exc:
+        return _blocked_payload(str(exc), t_start)
 
     # 整段一帧都没留下，说明屏幕基本没动。
     # 这里原来把上一张原样递回去：省一次识图，但交出去的图带着上一次的时间戳，
     # 问「我现在在干嘛」会拿到几小时前的画面。宁可多一张图，也要是现在的。
     static_run = False
     if not frames:
-        img, _ = _shot()
+        try:
+            img, _ = _shot()
+        except TargetMiss as exc:
+            return _blocked_payload(str(exc), t_start)
         frames = [(_big(img), CUT_ABS)]
         static_run = True
 
@@ -1548,6 +1641,7 @@ def run_once(cfg: dict) -> dict:
 
     # 只留下一帧时，先问一句「变的是哪块」。变化集中，就只把那块裁出来——
     # 模型那头会把整屏压到同一个 token 栅格，裁一小块反而换回一倍细节。
+    _owned_add(shot_dir, name)
     crop = None
     crop_box = None
     if len(frames) == 1 and diff_pair and focus == "whole":
@@ -1604,19 +1698,9 @@ def run_once(cfg: dict) -> dict:
                                 % (_APP_HIT["title"] or "(无标题)", _APP_HIT["proc"],
                                    _APP_HIT["w"], _APP_HIT["h"]))
         else:
-            if _PRINT_BLANK:
-                _why = _PRINT_BLANK
-            elif _APP_MATCHES == 0:
-                _why = "没找到这个窗口"
-            elif _APP_HUNG >= _APP_MATCHES:
-                _why = "匹配到 %d 个，全都没响应（可能卡住了）" % _APP_MATCHES
-            elif _APP_HUNG > 0:
-                _why = ("匹配到 %d 个，其中 %d 个没响应、其余最小化了"
-                        % (_APP_MATCHES, _APP_HUNG))
-            else:
-                _why = "匹配到 %d 个，但都抓不到（最小化了，或者尺寸太小）" % _APP_MATCHES
-            payload["note"] += (" 想抓窗口「%s」但没抓到（%s），这次退回整屏。"
-                                % (_APP_SPEC or "没填匹配串", _why))
+            payload["note"] += (" 想抓窗口「%s」但没抓到（%s），"
+                                "按设置退回了整屏——不想这样就关掉「抓不到就退回整屏」。"
+                                % (_APP_SPEC or "没填匹配串", _app_miss_reason()))
     if _TARGET == "window":
         payload["note"] += (" 这次只抓前台窗口那一块（不是整屏）。"
                             if not _WIN_FALLBACK else
@@ -1644,6 +1728,7 @@ def run_once(cfg: dict) -> dict:
         # 认字只认「变的那块」：整屏六十行里大半是没动的字。装箱那张缩到三分之一，
         # 字早糊了，所以只借裁切图、不借装箱图。
         src_png = os.path.join(shot_dir, "_ocr_src.png")
+        _owned_add(shot_dir, "_ocr_src.png")
         ocr_src = last_raw
         origin = (0, 0)
         if crop is not None and crop_box is not None:
@@ -1748,6 +1833,8 @@ def main(argv=None) -> int:
                     help="screen 抓整屏 / window 只抓前台窗口那一块")
     ap.add_argument("--app", default="",
                     help="target=app 时按进程名或标题片段找窗口，不分大小写")
+    ap.add_argument("--fallback-on-miss", action="store_true",
+                    help="抓不到目标时退回整屏（默认关：抓不到就报 blocked，不给图）")
     ap.add_argument("--diff-level", type=float, default=DIFF_LEVEL,
                     help="灰度差多少算变了，1-80，默认 10")
     ap.add_argument("--cut-abs", type=float, default=None,
@@ -1801,6 +1888,7 @@ def main(argv=None) -> int:
         "monitors": a.monitors,
         "target": a.target,
         "app": a.app,
+        "fallback_on_miss": bool(a.fallback_on_miss),
         "diff_level": a.diff_level,
         "cut_abs": a.cut_abs,
         "need": a.need,

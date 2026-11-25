@@ -41,6 +41,16 @@ const DEFAULTS = {
   target: "screen",
   /** target=app 时匹配的串：进程名（可带 .exe）或窗口标题片段，不分大小写。 */
   app: "",
+  /**
+   * 指定的窗口抓不到时，要不要退回整屏。默认 false：直接报错、不出图。
+   * 抓的是「这个窗口」，换成整屏等于把没被要求看的东西也交出去。
+   */
+  fallback_on_miss: false,
+  /**
+   * 工具的危险等级。ask（默认）会让宿主在每次调用前要一次确认；
+   * 宿主没有审批流时，ask 就等于拒——这是宁可不能用也不越权的意思。
+   */
+  tool_permission: "ask",
   /** 包围盒阈值：灰度差多少算「变了」，1-80，默认 10。 */
   diff_level: 10,
   /** 单帧突变门槛，0 = 用默认（整屏 12 / 认内容 2.5）。 */
@@ -103,6 +113,8 @@ type SidecarResult = {
   elapsed_ms?: number;
   pool?: Array<{ i?: number; t?: number; file?: string; score?: number }>;
   reused?: boolean;
+  /** status=blocked 时的原因：指定的窗口没抓到。 */
+  reason?: string;
   look?: string;
   note?: string;
   tier?: string;
@@ -148,6 +160,7 @@ function runSidecar(cfg: Config, seconds: number, maxFrames: number, maxWidth: n
     "--focus", String(cfg.focus),
     "--target", String(cfg.target ?? "screen"),
     ...(String(cfg.app ?? "").trim() ? ["--app", String(cfg.app).trim()] : []),
+    ...(cfg.fallback_on_miss ? ["--fallback-on-miss"] : []),
     ...(Number(cfg.diff_level) > 0 ? ["--diff-level", String(cfg.diff_level)] : []),
     ...(Number(cfg.cut_abs) > 0 ? ["--cut-abs", String(cfg.cut_abs)] : []),
     ...(Number(cfg.need) > 0 ? ["--need", String(cfg.need)] : []),
@@ -474,15 +487,9 @@ function normalizeSaved(raw: any): any {
   return out;
 }
 
-/** plugins.json 的 disabled 里没有 eyes，就算它开着。读不到也按开着算，宁可多提醒一次。 */
-async function eyesRunning(): Promise<boolean> {
-  try {
-    const raw = await readFile(join(HERE, "..", "..", "config", "plugins.json"), "utf8");
-    const list = JSON.parse(raw)?.disabled;
-    return !(Array.isArray(list) && list.includes("eyes"));
-  } catch {
-    return true;
-  }
+/** 本地视觉那一档在用吗。旧版去读宿主 plugins.json 判断 eyes 开没开，那是别人的私有配置，不读了。 */
+function localVisionOn(cfg: Config): boolean {
+  return String(cfg.vision_primary) === "ollama" || String(cfg.vision_backup) === "ollama";
 }
 
 export async function apply(ctx: Context) {
@@ -512,10 +519,13 @@ export async function apply(ctx: Context) {
   if (!existsSync(resolve(cfg.script))) {
     ctx.logger.warn(`看屏边车不在：${cfg.script}`);
   }
-  if (await eyesRunning()) {
+  if (localVisionOn(cfg)) {
     ctx.logger.warn(
-      "eyes 和 peek 同时启用：两者都要用本地视觉模型，显存不够会把整机挤到卡死。建议在插件管理里停用 eyes。",
+      `本地视觉这一档在用（${cfg.ollama_model}）。它会把模型拉进显卡，显存不够时整机可能卡住；同时还有别的插件在用本地视觉模型的话，留一个就够。`,
     );
+    if (cfg.tool_permission !== "safe") {
+      ctx.logger.warn("工具权限是 ask：宿主没有审批流时，抓屏会被直接拒。要能直接用，把设置里的权限改成 safe。");
+    }
   }
 
   ctx.tools.register({
@@ -523,7 +533,8 @@ export async function apply(ctx: Context) {
     description:
       "抓一段屏幕（默认 10 秒），只保留画面真正变化的那几帧，拼成一张图后看图说话。" +
       "问「我在干嘛」「屏幕上是什么」「刚才弹出什么了」「这个界面有什么」时用它。" +
-      "画面不动的时间几乎不留帧，所以不用担心浪费；但一次要等几秒到十几秒。",
+      "画面不动的时间几乎不留帧，所以不用担心浪费；但一次要等几秒到十几秒。" +
+      "抓到的画面会交给下面配的识图模型，不是留在本机——介意就别抓整屏。",
     schema: {
       type: "object",
       properties: {
@@ -558,7 +569,7 @@ export async function apply(ctx: Context) {
       },
       required: [],
     },
-    danger: "safe",
+    danger: cfg.tool_permission === "safe" ? "safe" : "ask",
     run: async (args: any, session: any) => {
       const seconds = Math.max(2, Math.min(60, Number(args?.seconds ?? cfg.seconds) || cfg.seconds));
       const maxFrames = Math.max(1, Math.min(12, Number(args?.max_frames ?? cfg.max_frames) || cfg.max_frames));
@@ -595,6 +606,18 @@ export async function apply(ctx: Context) {
           seconds, maxFrames, maxWidth);
       } catch (error: any) {
         return `错误：${error?.message ?? String(error)}`;
+      }
+
+      if (data.status === "blocked") {
+        const why = String(data.reason ?? "").trim() || "指定的窗口没抓到";
+        return [
+          `没抓到，这次没有出图：${why}`,
+          data.target === "app"
+            ? `要找的窗口：${appArg || "（没填匹配串）"}`
+            : "要找的窗口：前台窗口",
+          "没有退回整屏——那等于把没被要求看的东西也一起交出去。" +
+            "要允许退回，把设置里「抓不到就退回整屏」打开。",
+        ].join("\n");
       }
 
       const file = String(data.path ?? "");
@@ -792,11 +815,17 @@ export async function apply(ctx: Context) {
     async (_req, res) => {
       await reload();
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-      const warns = (await eyesRunning())
-        ? [
-            "eyes 插件也开着。它默认把本地 qwen3-vl:4b 视觉模型拉进显卡，和本插件同时用、显存又不够时，整机可能卡死（本机实测过）。留一个就够了，建议到插件管理里停用 eyes。",
-          ]
-        : [];
+      const warns: string[] = [];
+      if (localVisionOn(cfg)) {
+        warns.push(
+          `本地视觉这一档在用（${cfg.ollama_model}）。这种模型会把显存吃满，显存不够、或者同时有别的插件也在拉本地视觉模型时，整机可能卡住（本机实测过）。`,
+        );
+      }
+      if (cfg.tool_permission !== "safe") {
+        warns.push(
+          "工具权限是 ask：宿主每次调用前要先确认，没有审批流的宿主会直接拒掉。要让抓屏平时就能用，把「工具权限」改成 safe——代价是任何会话都能抓屏，画面也会交给识图模型。",
+        );
+      }
       res.end(renderPage(cfg, chatModels(ctx), warns));
     },
     { title: "看屏", navigation: true },
