@@ -502,13 +502,19 @@ export async function apply(ctx: Context) {
   }
   let cfg: Config = { ...DEFAULTS, ...normalizeSaved(saved) };
 
-  /** 每次调用重读配置：改 config.json 不用重启进程。 */
-  const reload = async () => {
+  /** 读一份当前配置：改 config.json 不用重启进程。
+   *
+   *  以前叫 reload()，把结果写回共享的 cfg。两个请求并发时，A 读到这里让出，
+   *  B 把 cfg 换掉，A 再往下走用的就是 B 的配置——A 按 text_layer=false 起边车，
+   *  回执却按 B 的 true 去解读。现在只读不写，调用方拿这一份用完就扔。
+   */
+  const readConfig = async (): Promise<Config> => {
     try {
       const again = (await ctx.config.read("config.json")) as Partial<Config> | null;
-      cfg = { ...DEFAULTS, ...normalizeSaved(again) };
+      return { ...DEFAULTS, ...normalizeSaved(again) };
     } catch {
-      // 读不到就沿用上一次那份
+      // 读不到就沿用启动时那份
+      return cfg;
     }
   };
 
@@ -572,38 +578,39 @@ export async function apply(ctx: Context) {
     },
     danger: cfg.tool_permission === "safe" ? "safe" : "ask",
     run: async (args: any, session: any) => {
-      const seconds = Math.max(2, Math.min(60, Number(args?.seconds ?? cfg.seconds) || cfg.seconds));
-      const maxFrames = Math.max(1, Math.min(12, Number(args?.max_frames ?? cfg.max_frames) || cfg.max_frames));
-      const maxWidth = Math.max(400, Math.min(4096, Number(args?.max_width ?? cfg.max_width) || cfg.max_width));
+      // 这一次调用用这一份配置，整轮不再读共享状态。
+      const cur = await readConfig();
+      const seconds = Math.max(2, Math.min(60, Number(args?.seconds ?? cur.seconds) || cur.seconds));
+      const maxFrames = Math.max(1, Math.min(12, Number(args?.max_frames ?? cur.max_frames) || cur.max_frames));
+      const maxWidth = Math.max(400, Math.min(4096, Number(args?.max_width ?? cur.max_width) || cur.max_width));
       const question = String(args?.question ?? "").trim();
-      // 本次调用的网格设置只影响这一次，不写回 cfg——下面 reload() 会把它盖掉，
+      // 本次调用的网格设置只影响这一次，不写回配置——下面 readConfig() 每次都是新的一份，
       // 以前就是在 reload 之后生效不出效果。
       const gridArg =
         args?.grid !== undefined && args?.grid !== null && String(args.grid).trim() !== ""
           ? String(args.grid).trim()
-          : String(cfg.grid ?? DEFAULTS.grid);
+          : String(cur.grid ?? DEFAULTS.grid);
       const poolArg =
         args?.pool_ttl_seconds !== undefined && args?.pool_ttl_seconds !== null && Number.isFinite(Number(args.pool_ttl_seconds))
           ? Math.max(0, Number(args.pool_ttl_seconds))
-          : Number(cfg.pool_ttl ?? 0);
+          : Number(cur.pool_ttl ?? 0);
       const monitorsArg =
         args?.monitors !== undefined && args?.monitors !== null && String(args.monitors).trim() !== ""
           ? String(args.monitors).trim()
-          : String(cfg.monitors ?? DEFAULTS.monitors);
+          : String(cur.monitors ?? DEFAULTS.monitors);
       const targetArg =
         args?.target !== undefined && args?.target !== null && String(args.target).trim() !== ""
           ? String(args.target).trim().toLowerCase()
-          : String(cfg.target ?? DEFAULTS.target);
+          : String(cur.target ?? DEFAULTS.target);
       const appArg =
         args?.app !== undefined && args?.app !== null && String(args.app).trim() !== ""
           ? String(args.app).trim()
-          : String(cfg.app ?? DEFAULTS.app);
-      await reload();
+          : String(cur.app ?? DEFAULTS.app);
 
       let data: SidecarResult;
       try {
         data = await runSidecar(
-          { ...cfg, grid: gridArg, pool_ttl: poolArg, monitors: monitorsArg, target: targetArg, app: appArg },
+          { ...cur, grid: gridArg, pool_ttl: poolArg, monitors: monitorsArg, target: targetArg, app: appArg },
           seconds, maxFrames, maxWidth);
       } catch (error: any) {
         return `错误：${error?.message ?? String(error)}`;
@@ -688,7 +695,10 @@ export async function apply(ctx: Context) {
         .map((x: any) => String(x ?? "").trim())
         .filter(Boolean);
       if (textFlags.length) parts.push(`文字层状态：${textFlags.join("；")}`);
-      if (!textPack.ok && (textPack.error || cfg.text_layer)) {
+      // 认字这一路自己挂了（没装语言包、OCR 引擎起不来），控件那一路可能还是好的。
+      // 以前这条只填在边车回执里、没人转发，看着就像「屏幕上没字」。
+      if (textPack.ocr_error) parts.push(`认字没认出来：${String(textPack.ocr_error)}`);
+      if (!textPack.ok && (textPack.error || cur.text_layer)) {
         // 失败原因原样带出来：超时、PS 起不来、回话不是 JSON、控件读崩了，
         // 每一种的处置都不一样。只说「没有回话」等于让人回去猜。
         const why = String(textPack.error ?? "").trim();
@@ -701,7 +711,7 @@ export async function apply(ctx: Context) {
       }
 
       try {
-        const look = await describe(ctx, cfg, session, file, question);
+        const look = await describe(ctx, cur, session, file, question);
         parts.push(`屏幕描述（${look.by}）：\n${look.text}`);
         if (look.note) parts.push(`说明：${look.note}`);
       } catch (error: any) {
@@ -720,11 +730,11 @@ export async function apply(ctx: Context) {
     const lines: string[] = [];
     let ok = true;
     try {
-      await reload();
+      const cur = await readConfig();
 
       // 1. python 起不起得来
-      const py = resolvePython(cfg.python);
-      const wantPy = String(cfg.python ?? "").trim();
+      const py = resolvePython(cur.python);
+      const wantPy = String(cur.python ?? "").trim();
       if (wantPy && !existsSync(wantPy))
         lines.push(`[!] 配置的 python 路径不存在：${wantPy}，已回落到 PATH 里的 python`);
       let pyOk = false;
@@ -745,7 +755,7 @@ export async function apply(ctx: Context) {
       }
 
       // 2. 边车脚本在不在
-      const script = resolve(cfg.script);
+      const script = resolve(cur.script);
       if (existsSync(script)) lines.push(`[✓] 边车脚本：${script}`);
       else { ok = false; lines.push(`[×] 边车脚本不在：${script}`); }
 
@@ -769,7 +779,7 @@ export async function apply(ctx: Context) {
       }
 
       // 3. 识图这两级各落到谁身上
-      const chain = buildChain(ctx, cfg, null);
+      const chain = buildChain(ctx, cur, null);
       if (!chain.length) {
         ok = false;
         lines.push("[×] 识图：一级和二级都没落上，没有能用的模型");
@@ -788,11 +798,11 @@ export async function apply(ctx: Context) {
       // 4. 本地 Ollama（本地是一级就必查；只是备用时查不到只提示，不算失败）
       const isFallback = !(chain.length && chain[0].kind === "ollama");
       try {
-        const r = await fetch(`${cfg.ollama}/api/tags`, { signal: AbortSignal.timeout(8000) });
+        const r = await fetch(`${cur.ollama}/api/tags`, { signal: AbortSignal.timeout(8000) });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const data: any = await r.json();
         const names: string[] = (data?.models ?? []).map((m: any) => String(m?.name ?? ""));
-        const want = String(cfg.ollama_model ?? "").trim();
+        const want = String(cur.ollama_model ?? "").trim();
         const hit = names.includes(want) || names.includes(want + ":latest") || names.some((n) => n.startsWith(want + ":"));
         if (hit) lines.push(`[✓] 本地模型 ${want} 在 Ollama 里（共 ${names.length} 个模型）`);
         else if (isFallback) lines.push(`[!] 本地退路 ${want} 不在 Ollama 里，对话模型看不了图时没人接手。现有：${names.slice(0, 8).join("、") || "一个都没有"}`);
@@ -801,20 +811,20 @@ export async function apply(ctx: Context) {
           lines.push(`[×] 本地模型 ${want} 不在 Ollama 里。现有：${names.slice(0, 8).join("、") || "一个都没有"}`);
         }
       } catch (error: any) {
-        if (isFallback) lines.push(`[!] 连不上 Ollama（${cfg.ollama}）：${error?.message ?? error}；只影响退路`);
+        if (isFallback) lines.push(`[!] 连不上 Ollama（${cur.ollama}）：${error?.message ?? error}；只影响退路`);
         else {
           ok = false;
-          lines.push(`[×] 连不上 Ollama（${cfg.ollama}）：${error?.message ?? error}`);
+          lines.push(`[×] 连不上 Ollama（${cur.ollama}）：${error?.message ?? error}`);
         }
       }
 
       // 5. 出图目录能不能建
       try {
-        await mkdir(cfg.shot_dir, { recursive: true });
-        lines.push(`[✓] 出图目录：${cfg.shot_dir}`);
+        await mkdir(cur.shot_dir, { recursive: true });
+        lines.push(`[✓] 出图目录：${cur.shot_dir}`);
       } catch (error: any) {
         ok = false;
-        lines.push(`[×] 出图目录建不出来：${cfg.shot_dir} —— ${error?.message ?? error}`);
+        lines.push(`[×] 出图目录建不出来：${cur.shot_dir} —— ${error?.message ?? error}`);
       }
 
       lines.push("");
@@ -828,20 +838,20 @@ export async function apply(ctx: Context) {
   ctx.web.page(
     "/plugins/peek/",
     async (_req, res) => {
-      await reload();
+      const cur = await readConfig();
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
       const warns: string[] = [];
-      if (localVisionOn(cfg)) {
+      if (localVisionOn(cur)) {
         warns.push(
-          `本地视觉这一档在用（${cfg.ollama_model}）。这种模型会把显存吃满，显存不够、或者同时有别的插件也在拉本地视觉模型时，整机可能卡住（本机实测过）。`,
+          `本地视觉这一档在用（${cur.ollama_model}）。这种模型会把显存吃满，显存不够、或者同时有别的插件也在拉本地视觉模型时，整机可能卡住（本机实测过）。`,
         );
       }
-      if (cfg.tool_permission !== "safe") {
+      if (cur.tool_permission !== "safe") {
         warns.push(
           "工具权限是 ask：宿主每次调用前要先确认，没有审批流的宿主会直接拒掉。要让抓屏平时就能用，把「工具权限」改成 safe——代价是任何会话都能抓屏，画面也会交给识图模型。",
         );
       }
-      res.end(renderPage(cfg, chatModels(ctx), warns));
+      res.end(renderPage(cur, chatModels(ctx), warns));
     },
     { title: "看屏", navigation: true },
   );

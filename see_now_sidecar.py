@@ -995,6 +995,15 @@ def _print_window(hwnd):
 _WIN_TRACE = {"hwnd": 0, "rect": None, "id": None}
 
 
+def _current_target_identity():
+    """这一轮的图属于哪个窗口。整屏档没有「某个窗口」这回事，返回 None。"""
+    if _TARGET == "window":
+        return _WIN_TRACE.get("id")
+    if _TARGET == "app":
+        return (_APP_HIT or {}).get("id")
+    return None
+
+
 def _window_rect():
     """前台窗口的物理像素矩形 (l, t, r, b)；拿不到就 None。
 
@@ -1070,7 +1079,23 @@ def _identity_same(a, b) -> bool:
         return False
     if a.get("title") and b.get("title") and a["title"] != b["title"]:
         return False
-    return bool(a.get("pid") or a.get("cls") or a.get("title"))
+    # 三项里一项都没对上过（各自有一项、但两边没有共同的已知项），
+    # 那就不是「同一份身份」，是两份互不相干的身份——不能当成同一个窗口放行。
+    compared = [k for k in ("pid", "cls", "title") if a.get(k) and b.get(k)]
+    return bool(compared)
+
+
+def _ident_label(ident) -> str:
+    """一句话说清这份身份是哪个窗口，给回执用。"""
+    if not ident:
+        return "(没有身份)"
+    title = str(ident.get("title") or "").strip()
+    pid = int(ident.get("pid") or 0)
+    if title:
+        return "《%s》 pid %d" % (title, pid) if pid else "《%s》" % title
+    if pid:
+        return "pid %d 的无标题窗口" % pid
+    return "(没有身份)"
 
 
 def _identity_usable(ident) -> bool:
@@ -1405,6 +1430,16 @@ def _near(a: str, b: str) -> bool:
     return best >= 0.86
 
 
+def _mk_tmp_png(dirpath):
+    """建一个独占的临时图路径。失败返回 (None, 原因)，不抛。"""
+    try:
+        fd, path = tempfile.mkstemp(prefix="_ocr_", suffix=".png", dir=dirpath)
+        os.close(fd)
+        return path, ""
+    except Exception as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+
+
 def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0,
                 skip_uia: bool = False, identity=None) -> dict:
     """把屏幕编译成文字与坐标，摆在模型面前当文本读。
@@ -1544,10 +1579,16 @@ def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0,
     }
     # 跳过控件读取的原因要跟着回执一起出去。不然只看到「没有控件」，分不清是
     # 屏幕上本来就空，还是我们主动没读——后者必须写明，否则等于静默换了范围。
-    for key in ("uia_skipped", "identity_weak", "uia_error"):
+    # 跳过控件、身份偏弱、两个探测各自的错，都要跟着回执出去。ocr_error 以前
+    # 漏在这里：ps1 那头 ok 恒为 true，认字失败只填 ocr_error，Python 又不转发，
+    # 结果一个字没认出来，回执里只说「没有回话」，看不出是 OCR 挂了还是屏上空。
+    for key in ("uia_skipped", "identity_weak", "uia_error", "ocr_error"):
         val = str(data.get(key) or "").strip()
         if val:
             out[key] = val
+    if not out["blocks"] and out.get("ocr_error"):
+        out["ok"] = False
+        out["error"] = "认字没成：%s" % out["ocr_error"]
     return out
 
 
@@ -1847,12 +1888,25 @@ def run_once(cfg: dict) -> dict:
     # 问「我现在在干嘛」会拿到几小时前的画面。宁可多一张图，也要是现在的。
     static_run = False
     if not frames:
+        # 补拍的这一张是「现在」的，窗口身份得跟着现在的那一刻走。
+        # 以前只在补拍后刷新身份：中间前台换了人，新窗口就用自己的身份
+        # 给自己那张图作证，图和控件对不上也没人发现。
+        need_ident = _TARGET in ("window", "app")
+        id_before = _current_target_identity() if need_ident else None
         try:
             img, _ = _shot()
         except TargetMiss as exc:
             return _blocked_payload(str(exc), t_start)
+        id_after = _current_target_identity() if need_ident else None
+        if id_before and id_after and not _identity_same(id_before, id_after):
+            return _blocked_payload(
+                "补拍这一张的时候目标窗口换了（%s → %s），图和窗口对不上"
+                % (_ident_label(id_before), _ident_label(id_after)), t_start)
         frames = [(_big(img), CUT_ABS)]
         static_run = True
+        # 补拍拿的是刚抓的一张，上一轮那对差分帧已经过期。
+        # 留着它，下面「只留一帧就裁变化区」会去裁一张旧图，配的却是新图的身份。
+        diff_pair = None
 
     name = "see_now_" + time.strftime("%Y%m%d-%H%M%S") + ".png"
     path = os.path.join(shot_dir, name)
@@ -1948,13 +2002,20 @@ def run_once(cfg: dict) -> dict:
     if tier_line:
         payload["tier"] = tier_line
 
+    # 临时图先建：建不出来（目录没了、盘满、权限）只该赔掉文字层，
+    # 不该把已经抓到的那张图一起赔进去——以前 mkstemp 裸在外面，
+    # 一抛异常整次抓屏就变成 status=error，图也白抓了。
+    src_png, mk_err = "", ""
     if cfg.get("text_layer"):
+        src_png, mk_err = _mk_tmp_png(shot_dir)
+        if not src_png:
+            payload["text"] = {"ok": False, "target": _TARGET,
+                               "error": "文字层临时图建不出来：" + mk_err}
+    if cfg.get("text_layer") and src_png:
         # 认字只认「变的那块」：整屏六十行里大半是没动的字。装箱那张缩到三分之一，
         # 字早糊了，所以只借裁切图、不借装箱图。
         # 独占建一个随机名临时图。以前写死 _ocr_src.png：目录里本来就有同名文件的话，
         # 先被覆盖、再被 finally 删掉，归属清单也护不住别人的东西。
-        fd, src_png = tempfile.mkstemp(prefix="_ocr_", suffix=".png", dir=shot_dir)
-        os.close(fd)
         ocr_src = last_raw
         origin = (0, 0)
         if crop is not None and crop_box is not None:
