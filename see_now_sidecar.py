@@ -28,6 +28,7 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -78,6 +79,8 @@ _SHOT_ORIGIN = [0, 0]
 # 抓屏范围：screen 按显示器设置抓整屏；window 只抓前台窗口那一块（窗口动，逐帧跟着走）。
 _TARGET = "screen"
 _WIN_SCREEN = None       # 窗口模式下用来夹边界的屏尺寸
+#: 显示器坐标没校准好时的说明；空串表示没这回事。写进回执，不静默。
+_CALIB_NOTE = ""
 _WIN_FALLBACK = False    # 窗口没抓到、退回整屏时为 True，写进说明
 #: 抓不到指定窗口时，允不允许悄悄换成一整屏。默认 False：
 #: 用户点的是「抓这个窗口」，换范围等于把没被要求看的东西也交出去。
@@ -254,7 +257,8 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
         if hit is not None:
             got = _print_window(hit["hwnd"])
             if got is not None:
-                img, org = got
+                img, org, ident = got
+                hit["id"] = ident   # 成像那一刻的身份，文字层用这份
                 _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = org
                 _RAW_SIZE[0], _RAW_SIZE[1] = img.size
                 small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR),
@@ -266,17 +270,29 @@ def _shot() -> tuple[Image.Image, np.ndarray]:
                              % (_APP_SPEC or "（没填匹配串）", _app_miss_reason()))
         _APP_FALLBACK = True
     if _TARGET == "window":
-        box = _window_box(_WIN_SCREEN or _display_size(rects))
-        if box:
-            img = ImageGrab.grab(bbox=box)
-            _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = box[0], box[1]
-            _RAW_SIZE[0], _RAW_SIZE[1] = img.size
-            small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR), dtype=np.float32)
-            return img, small
-        # 窗口最小化、拿不到句柄。
-        if not _FALLBACK_ON_MISS:
-            raise TargetMiss("拿不到前台窗口的框（可能最小化了）")
-        _WIN_FALLBACK = True
+        # 让窗口自己画到内存 DC 上，不再 ImageGrab.grab(bbox=...)。
+        # 那个写法在 Windows 上仍是「先抓一整屏、再裁一块」：明明只说抓这个窗口，
+        # 屏幕上别处的像素也被读了一遍。PrintWindow 不碰其他区域。
+        rect = _window_rect()
+        if rect:
+            got = _print_window(int(_WIN_TRACE.get("hwnd") or 0))
+            if got is not None:
+                img, org, ident = got
+                _WIN_TRACE["id"] = ident   # 覆盖 _window_rect 提前取的那份
+                _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = org
+                _RAW_SIZE[0], _RAW_SIZE[1] = img.size
+                small = np.asarray(img.convert("RGB").resize(GRID, Image.BILINEAR),
+                                   dtype=np.float32)
+                return img, small
+            if not _FALLBACK_ON_MISS:
+                raise TargetMiss("前台窗口抓不到内容：%s"
+                                 % (_PRINT_BLANK or "可能最小化了，或者没有响应"))
+            _WIN_FALLBACK = True
+        else:
+            # 窗口最小化、拿不到句柄。
+            if not _FALLBACK_ON_MISS:
+                raise TargetMiss("拿不到前台窗口的框（可能最小化了）")
+            _WIN_FALLBACK = True
     if not rects:
         img = ImageGrab.grab()
         _SHOT_ORIGIN[0], _SHOT_ORIGIN[1] = 0, 0
@@ -561,6 +577,39 @@ def _pack(frames: list[tuple[np.ndarray, float]], out: str,
 
 
 
+def _desktop_physical_size():
+    """整块桌面的物理像素尺寸 (w, h)；问系统要，不抓屏。
+
+    GetDeviceCaps 的 DESKTOPHORZRES / DESKTOPVERTRES 给的是真实分辨率，
+    进程没声明 DPI 感知也不会被虚拟化成 96。以前为了这一个数字去抓一张整屏，
+    等于「只想抓某个窗口」的时候也读了别处的像素。
+    """
+    if not sys.platform.startswith("win"):
+        return (0, 0)
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        if not hdc:
+            return (0, 0)
+        try:
+            w = int(gdi32.GetDeviceCaps(hdc, 118) or 0)   # DESKTOPHORZRES
+            h = int(gdi32.GetDeviceCaps(hdc, 117) or 0)   # DESKTOPVERTRES
+        finally:
+            user32.ReleaseDC(0, hdc)
+        if w > 0 and h > 0:
+            return (w, h)
+        return (0, 0)
+    except Exception:
+        return (0, 0)
+
+
+def _desktop_physical_width():
+    return _desktop_physical_size()[0]
+
+
 def _dpi_scale(hwnd=None) -> float:
     """Win32 给窗口坐标是逻辑像素还是物理像素，取决于进程有没有声明 DPI 感知。
 
@@ -655,20 +704,27 @@ def _monitors() -> list[dict]:
         # 自校准：_dpi_scale 走的是 GetDpiForSystem，未声明 DPI 感知的进程会被
         # 虚拟化成 96，返回 1.0 —— 可 ImageGrab 抓的是物理像素。两者差 1.5 倍时，
         # 单屏抓出来就只有屏幕左上角那一块（之前实测 1707×1067，真屏 2560×1600）。
-        # 拿一张实抓的主屏图比宽度，以它为准，不信任何一层换算。
-        try:
-            probe = ImageGrab.grab()
-            pw = probe.size[0]
-            pm = [m for m in found if m["primary"]] or found
-            base = (pm[0]["right"] - pm[0]["left"]) if pm else 0
-            if base > 0 and pw > 0:
-                factor = pw / float(base)
-                if 0.25 < factor < 4.0 and abs(factor - 1.0) > 0.02:
-                    for m in found:
-                        for k in ("left", "top", "right", "bottom"):
-                            m[k] = int(round(m[k] * factor))
-        except Exception as exc:
-            logger.warning("[see_now] 显示器尺寸校准失败，按原值用：%s", exc)
+        # 物理宽度问系统要（GetDeviceCaps），不再抓一张整屏去量——那个数字够了，
+        # 而抓整屏意味着「只抓某个窗口」的时候也读了别处的像素。
+        pw = _desktop_physical_width()
+        pm = [m for m in found if m["primary"]] or found
+        base = (pm[0]["right"] - pm[0]["left"]) if pm else 0
+        global _CALIB_NOTE
+        if pw <= 0 or base <= 0:
+            # 以前这里什么都不说，factor 不乘就当校准过了。结果「量不出来」
+            # 和「量出来正好是 1 倍」在回执里长得一模一样。
+            _CALIB_NOTE = ("量不出桌面的物理尺寸（GetDeviceCaps %d，主屏宽 %d），"
+                           "显示器坐标没校准；抓单屏一般没事，选多屏时可能偏。"
+                           % (pw, base))
+        else:
+            factor = pw / float(base)
+            if 0.25 < factor < 4.0 and abs(factor - 1.0) > 0.02:
+                for m in found:
+                    for k in ("left", "top", "right", "bottom"):
+                        m[k] = int(round(m[k] * factor))
+            elif not (0.25 < factor < 4.0):
+                _CALIB_NOTE = ("桌面物理宽度 %d 和主屏矩形宽 %d 差得太远（%.2f 倍），"
+                               "没敢校准；抓多屏时可能偏。" % (pw, base, factor))
         found.sort(key=lambda m: (not m["primary"], m["left"], m["top"]))
         for i, m in enumerate(found, 1):
             m["n"] = i
@@ -730,10 +786,10 @@ def _display_size(rects=None):
                 max(m["bottom"] for m in _ALL_MONS))
     if rects:
         return (rects[0]["w"], rects[0]["h"])
-    try:
-        return ImageGrab.grab().size
-    except Exception:
-        return (1920, 1080)
+    size = _desktop_physical_size()
+    # 拿不到就返回 (0, 0)，让调用方报错——以前这里假装 1920x1080，
+    # 于是「量不出屏」和「量出来的确是这个尺寸」在回执里长得一模一样。
+    return size if size[0] > 0 else (0, 0)
 
 
 # ---- 按名字抓窗口（target = app）----
@@ -841,7 +897,10 @@ def _pick_app():
 
 
 def _print_window(hwnd):
-    """把一个窗口连内容一起画到内存里，返回（PIL 图，原点 (l, t)）；拿不到返回 None。
+    """把一个窗口连内容一起画到内存里，返回（PIL 图，原点 (l, t)，成像那一刻的窗口身份）。
+
+    身份在这里取，不在抓完之后再问一次：后者是让新窗口用自己的身份核自己。
+    拿不到返回 None。
 
     和 ImageGrab 的区别：ImageGrab 抓屏幕上那块像素，窗口被别的窗口挡住时，
     抓回来的就是挡住它的那个人。PrintWindow 让窗口自己画到内存 DC 上，
@@ -883,6 +942,10 @@ def _print_window(hwnd):
                         ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
                         ("biClrImportant", wintypes.DWORD)]
 
+        # 身份必须贴着成像这一瞬取。抓完图再问一次等于让窗口自证：
+        # 那几百毫秒里句柄可能已被系统回收、分配给另一个窗口，回去取到的就是新的。
+        ident = _window_identity(hwnd_int)
+
         hdc = u32.GetWindowDC(hwnd)
         if not hdc:
             return None
@@ -909,7 +972,11 @@ def _print_window(hwnd):
                 _PRINT_BLANK = "抓到的画面是一片单色（%s），这个窗口自己画不出内容" % (
                     "全黑" if int(probe.max()) < 24 else "全是同一个颜色")
                 return None
-            return img, (int(round(rect.left * s)), int(round(rect.top * s)))
+            # 画到一半窗口被换掉（句柄复用）：这一帧的内容和身份不是一对，别用。
+            if not _identity_same(ident, _window_identity(hwnd_int)):
+                _PRINT_BLANK = "成像期间窗口换了（句柄被复用），这一帧不可信"
+                return None
+            return img, (int(round(rect.left * s)), int(round(rect.top * s))), ident
         finally:
             try:
                 g32.SelectObject(mdc, old)
@@ -921,6 +988,11 @@ def _print_window(hwnd):
     except Exception:
         return None
 
+
+
+#: 成像那一下的前台窗口是谁、框在哪。文字层用这个，认字时不再问一次前台：
+#: 那几百毫秒里焦点一换，控件清单就跟图对不上了。
+_WIN_TRACE = {"hwnd": 0, "rect": None, "id": None}
 
 
 def _window_rect():
@@ -952,9 +1024,112 @@ def _window_rect():
                                         int(round(right * _s)), int(round(bottom * _s)))
         if right - left < 160 or bottom - top < 120:
             return None
+        _WIN_TRACE["hwnd"] = int(hwnd)
+        _WIN_TRACE["rect"] = (left, top, right, bottom)
+        _WIN_TRACE["id"] = _window_identity(hwnd)
         return (left, top, right, bottom)
     except Exception:
         return None
+
+
+def _window_identity(hwnd) -> dict:
+    """窗口的身份指纹：进程 id、类名、标题。
+
+    为什么不能只认句柄：HWND 会被系统回收，再分配给一个新建的窗口——号码一样，
+    内容已经不是。拿它去问控件树，问到的就是别人家的控件。
+    """
+    out = {"pid": 0, "cls": "", "title": ""}
+    if not sys.platform.startswith("win"):
+        return out
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        u32 = ctypes.windll.user32
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(wintypes.HWND(int(hwnd)), ctypes.byref(pid))
+        buf = ctypes.create_unicode_buffer(512)
+        u32.GetWindowTextW(wintypes.HWND(int(hwnd)), buf, 512)
+        cbuf = ctypes.create_unicode_buffer(256)
+        u32.GetClassNameW(wintypes.HWND(int(hwnd)), cbuf, 256)
+        out["pid"] = int(pid.value)
+        out["title"] = buf.value
+        out["cls"] = cbuf.value
+    except Exception:
+        pass
+    return out
+
+
+def _identity_same(a, b) -> bool:
+    """两次取到的身份是不是同一个窗口。三项里任何一项已知且对不上，就不是。"""
+    if not a or not b:
+        return False
+    if a.get("pid") and b.get("pid") and a["pid"] != b["pid"]:
+        return False
+    if a.get("cls") and b.get("cls") and a["cls"] != b["cls"]:
+        return False
+    if a.get("title") and b.get("title") and a["title"] != b["title"]:
+        return False
+    return bool(a.get("pid") or a.get("cls") or a.get("title"))
+
+
+def _identity_usable(ident) -> bool:
+    """这份身份够不够拿去核窗口。
+
+    只有 pid 不够。同一个进程可以开好几个窗口，句柄被系统回收、再分配给
+    同进程的另一个窗口时，pid 照样对得上；类名也一样（Chrome 每个窗口都是
+    同一个类）。真正能分开同进程窗口的只有标题。所以：标题非空才算够；
+    标题是空的那种（少数无题窗口），退一步要求 pid 和类名都在——比裸 pid 强，
+    但仍然弱，回执里会写明是按弱判据放行的。
+    """
+    if not ident:
+        return False
+    pid = int(ident.get("pid") or 0)
+    cls = str(ident.get("cls") or "").strip()
+    title = str(ident.get("title") or "").strip()
+    return bool(title) or bool(pid and cls)
+
+
+def _identity_weak(ident) -> bool:
+    """是不是按弱判据（没有标题、只有 pid + 类名）放行的。"""
+    if not ident:
+        return False
+    return not str(ident.get("title") or "").strip()
+
+
+def _confirm_text_window():
+    """窗口模式下把成像时的句柄交给文字层；认不出同一个窗口就不读控件。
+
+    返回 (hwnd, skip_uia)。句柄失效、或者窗口位置已经变了（用户拖走了、换了）——
+    控件树跟这张图就不是一回事了，那就只认图上的字。
+    """
+    hwnd = int(_WIN_TRACE.get("hwnd") or 0)
+    rect = _WIN_TRACE.get("rect")
+    if not hwnd or not rect:
+        return (0, True)
+    if not sys.platform.startswith("win"):
+        return (0, True)
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(wintypes.HWND(hwnd)):
+            return (0, True)
+        cur = wintypes.RECT()
+        if not user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(cur)):
+            return (0, True)
+        s = _dpi_scale(hwnd)
+        got = (cur.left * s, cur.top * s, cur.right * s, cur.bottom * s)
+        for i in range(4):
+            if abs(float(got[i]) - float(rect[i])) > 8:
+                return (0, True)
+        # 位置对上还不够：句柄可能已经被系统回收、分配给了另一个窗口。
+        if not _identity_same(_WIN_TRACE.get("id"), _window_identity(hwnd)):
+            return (0, True)
+    except Exception:
+        return (0, True)
+    return (hwnd, False)
 
 
 def _window_box(screen_size):
@@ -1230,7 +1405,8 @@ def _near(a: str, b: str) -> bool:
     return best >= 0.86
 
 
-def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0) -> dict:
+def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0,
+                skip_uia: bool = False, identity=None) -> dict:
     """把屏幕编译成文字与坐标，摆在模型面前当文本读。
 
     两条腿都借自 Windows 自己：UI Automation 报控件树，Media.Ocr 抠字。
@@ -1247,15 +1423,46 @@ def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0) -> dict:
         # 只让 UIA 报这一个窗口的控件。抓 app 档时前台可能是别的程序，
         # 不问清楚就会把别人的控件树一起交出去。
         cmd += ["-WindowHandle", str(int(hwnd))]
+    if skip_uia:
+        # 认不出「同一个窗口」就别读控件：宁可只给图上的字，也不给错窗的字。
+        cmd += ["-SkipUia"]
+    idfile = ""
+    if identity:
+        # 把身份一并递过去，让 PowerShell 那一侧自己再核一遍：真正读控件树的是它，
+        # 只在 Python 这头核对，等于让被核对的人自己说「我是谁」。
+        # 走文件不走命令行：窗口标题是中文，实测经命令行传过去编码就变了，
+        # 于是「同一个窗口」被判成「对不上」——假阳性比不核还坏。
+        try:
+            fd, idfile = tempfile.mkstemp(prefix="_winid_", suffix=".json",
+                                         dir=os.path.dirname(png) or ".")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump({"pid": int(identity.get("pid") or 0),
+                           "cls": str(identity.get("cls") or ""),
+                           "title": str(identity.get("title") or "")},
+                          fh, ensure_ascii=False)
+            cmd += ["-ExpectJson", idfile]
+        except Exception as exc:
+            logger.warning("[see_now] 身份文件写不出：%s", exc)
+            idfile = ""
+            cmd += ["-SkipUia"]
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+    except subprocess.TimeoutExpired:
+        # 超时是最常见的一种失败，单独说清是等了几秒、还没等到字。
+        return {"ok": False, "error": "powershell 超时（%g 秒没回话），这次没等到字" % timeout}
     except Exception as exc:
         return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
-
+    finally:
+        # 超时、异常都要清掉，不然 _winid_*.json 会在截图目录里越积越多。
+        if idfile:
+            try:
+                os.remove(idfile)
+            except OSError:
+                pass
     raw = (proc.stdout or "").strip()
     if not raw:
         return {"ok": False, "error": "powershell 没回话"}
@@ -1325,7 +1532,7 @@ def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0) -> dict:
         blocks.append(row)
     blocks.sort(key=lambda b: (b["y"] // 28, b["x"]))
 
-    return {
+    out = {
         "ok": True,
         "window": str(data.get("window") or "").strip(),
         "elements": elements[:40],
@@ -1335,6 +1542,13 @@ def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0) -> dict:
         "chars": len(text),
         "ms": int(data.get("elapsed_ms") or 0),
     }
+    # 跳过控件读取的原因要跟着回执一起出去。不然只看到「没有控件」，分不清是
+    # 屏幕上本来就空，还是我们主动没读——后者必须写明，否则等于静默换了范围。
+    for key in ("uia_skipped", "identity_weak", "uia_error"):
+        val = str(data.get(key) or "").strip()
+        if val:
+            out[key] = val
+    return out
 
 
 # ---------------- 边车入口：把工具那段搬成命令行 ----------------
@@ -1540,7 +1754,7 @@ def _dump_pool(frames: list, shot_dir: str, cfg: dict, span: float) -> list:
 
 def _blocked_payload(reason: str, t0: float) -> dict:
     """抓不到目标时的回执：明确说没抓到，不给图，也不假装换了范围。"""
-    return {
+    out = {
         "status": "blocked",
         "reason": reason,
         "target": _TARGET,
@@ -1550,13 +1764,18 @@ def _blocked_payload(reason: str, t0: float) -> dict:
                 "没退回整屏——那会把没被要求看的东西也一起交出去。"
                 "要允许退回，在设置里打开「抓不到就退回整屏」。" % reason,
     }
+    if _CALIB_NOTE:
+        out["calibration"] = _CALIB_NOTE
+    return out
 
 
 def run_once(cfg: dict) -> dict:
     """抓一段 → 留帧 → 装箱 / 裁变化区 → 可选认字 → 返回一份 JSON 用的字典。"""
-    global _TARGET, _DIFF_LEVEL, _WIN_FALLBACK, _WIN_SCREEN
+    global _TARGET, _DIFF_LEVEL, _WIN_FALLBACK, _WIN_SCREEN, _CALIB_NOTE
     global _APP_SPEC, _APP_FALLBACK, _APP_HIT, _APP_MATCHES, _APP_HUNG
     global _FALLBACK_ON_MISS
+    # 先清再列屏：_monitors 里就是写这条说明的地方，清在它后面等于当场抹掉。
+    _CALIB_NOTE = ""
     picked = _set_monitors(str(cfg.get("monitors") or "").strip())
     _TARGET = str(cfg.get("target") or "screen").strip().lower()
     if _TARGET not in ("screen", "window", "app"):
@@ -1732,16 +1951,51 @@ def run_once(cfg: dict) -> dict:
     if cfg.get("text_layer"):
         # 认字只认「变的那块」：整屏六十行里大半是没动的字。装箱那张缩到三分之一，
         # 字早糊了，所以只借裁切图、不借装箱图。
-        src_png = os.path.join(shot_dir, "_ocr_src.png")
-        _owned_add(shot_dir, "_ocr_src.png")
+        # 独占建一个随机名临时图。以前写死 _ocr_src.png：目录里本来就有同名文件的话，
+        # 先被覆盖、再被 finally 删掉，归属清单也护不住别人的东西。
+        fd, src_png = tempfile.mkstemp(prefix="_ocr_", suffix=".png", dir=shot_dir)
+        os.close(fd)
         ocr_src = last_raw
         origin = (0, 0)
         if crop is not None and crop_box is not None:
             ocr_src = crop
             origin = (int(crop_box[0]), int(crop_box[1]))
+        # 提前定义：下面 except 和失败分支都要用它。若 save 先抛错，
+        # try 里那句赋值就跑不到，后面引用会 NameError。
+        skip_uia = False
         try:
             ocr_src.save(src_png)
-            pack = _text_layer(src_png, hwnd=(_APP_HIT["hwnd"] if (_TARGET == "app" and _APP_HIT) else 0))
+            text_hwnd, skip_uia, ident = 0, False, None
+            if _TARGET == "app":
+                if _APP_HIT and not _APP_FALLBACK:
+                    text_hwnd = int(_APP_HIT["hwnd"])
+                    # 用成像那一刻存下的身份。在这里重新取一次，等于让当前那个
+                    # 窗口自证它是图上那个——句柄被复用时分不出来。
+                    ident = _APP_HIT.get("id")
+                    if not _identity_same(ident, _window_identity(text_hwnd)):
+                        text_hwnd, ident = 0, None
+                        skip_uia = True
+                else:
+                    # app 档退回整屏了（窗口抓不到内容、或者压根没匹配上）。
+                    # 这张图是整屏，控件树只覆盖某一个窗口，两者不是一回事；
+                    # 这时去读那个窗口的控件，就是把别人的字贴到整屏图上。
+                    skip_uia = True
+            elif _TARGET == "window":
+                if _WIN_FALLBACK:
+                    # 图是整屏、控件树只覆盖一个窗口，两者对不上。
+                    # 这时去问前台窗口，就是把别人的控件字贴到整屏图上。
+                    skip_uia = True
+                else:
+                    text_hwnd, skip_uia = _confirm_text_window()
+                    if text_hwnd and not skip_uia:
+                        ident = _WIN_TRACE.get("id")
+            if text_hwnd and not skip_uia and not _identity_usable(ident):
+                skip_uia = True
+            pack = _text_layer(src_png, hwnd=text_hwnd, skip_uia=skip_uia, identity=ident)
+        except Exception as exc:
+            # 认字这一步自己炸了（存图失败、编码错、PS 起不来），别让异常冒到外面：
+            # 冒出去就只有一句「没成」，看不出卡在哪一步。
+            pack = {"ok": False, "error": "文字层出异常：%s: %s" % (type(exc).__name__, exc)}
         finally:
             try:
                 os.remove(src_png)
@@ -1754,6 +2008,12 @@ def run_once(cfg: dict) -> dict:
                     line["x"] = int(line.get("x") or 0) + origin[0]
                     line["y"] = int(line.get("y") or 0) + origin[1]
             pack["crop_origin"] = {"x": origin[0], "y": origin[1]}
+        if isinstance(pack, dict) and not pack.get("ok"):
+            # 失败也交出去：原因、跳没跳控件、抓的是哪一档，都得跟着回执。
+            pack["target"] = _TARGET
+            if skip_uia and not pack.get("uia_skipped"):
+                pack["uia_skipped"] = "这一档对不上，这次没读控件"
+            payload["text"] = pack
         if isinstance(pack, dict) and pack.get("ok"):
             payload["text"] = pack
             payload["note"] += (" 另外 text.blocks 已经拼好：控件和字合成一份，"
@@ -1806,6 +2066,12 @@ def run_once(cfg: dict) -> dict:
 
     pool = _dump_pool(frames, shot_dir, cfg, span)
     payload["pool"] = pool
+
+    # 放在所有 note 都拼完之后：static_run 那条会整段覆盖 note，
+    # 早拼进去就被吃掉了。
+    if _CALIB_NOTE:
+        payload["calibration"] = _CALIB_NOTE
+        payload["note"] += " " + _CALIB_NOTE
 
     _save_last(shot_dir, payload)
     logger.info("[see_now] %s 抓 %d 留 %d", name, shots, len(frames))

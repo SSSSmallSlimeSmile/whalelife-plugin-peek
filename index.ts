@@ -35,7 +35,8 @@ const DEFAULTS = {
   /** whole / content / auto —— auto 先整屏抓，热点占屏 8%-60% 才裁。 */
   focus: "auto",
   /**
-   * screen 按显示器设置抓整屏；window 只抓前台窗口那一块（窗口动静逐帧跟）；
+   * screen 按显示器设置抓整屏；window 只抓前台窗口那一块（窗口动静逐帧跟，
+ * 走 PrintWindow，不先抓整屏再裁）；
    * app 按进程名或标题抓指定窗口，后台、被遮挡也能抓。
    */
   target: "screen",
@@ -668,18 +669,32 @@ export async function apply(ctx: Context) {
 
       const window = String(data.text?.window ?? "").trim();
       const blocks = data.text?.blocks ?? [];
-      if (data.text?.ok && (window || blocks.length)) {
+      const textPack: any = data.text ?? {};
+      if (textPack.ok && (window || blocks.length)) {
         const lines = blocks
           .slice(0, 40)
           .map((b) => (b.t ? String(b.t) : ""))
           .filter(Boolean);
         parts.push(
-          `文字层（UIA + OCR${data.text.ocr_lang ? "，" + data.text.ocr_lang : ""}）` +
+          `文字层（UIA + OCR${textPack.ocr_lang ? "，" + textPack.ocr_lang : ""}）` +
             (window ? `｜窗口：${window}` : "") +
             (lines.length ? "\n" + lines.join(" / ") : ""),
         );
       }
 
+      // 跳过控件读取、按弱判据放行、读取报错——这三种都必须跟着回执出去。
+      // 不然只看到「没有控件」，分不清是屏幕上本来就空，还是我们主动没读。
+      const textFlags = [textPack.uia_skipped, textPack.identity_weak, textPack.uia_error]
+        .map((x: any) => String(x ?? "").trim())
+        .filter(Boolean);
+      if (textFlags.length) parts.push(`文字层状态：${textFlags.join("；")}`);
+      if (!textPack.ok && (textPack.error || cfg.text_layer)) {
+        // 失败原因原样带出来：超时、PS 起不来、回话不是 JSON、控件读崩了，
+        // 每一种的处置都不一样。只说「没有回话」等于让人回去猜。
+        const why = String(textPack.error ?? "").trim();
+        const where = textPack.target ? `（${String(textPack.target)} 档）` : "";
+        parts.push(why ? `文字层没成${where}：${why}` : "文字层没成：边车没给原因，可能这一步根本没跑到");
+      }
       if (!file || !existsSync(file)) {
         parts.push("没有出图，这部分没看成。");
         return parts.join("\n");
