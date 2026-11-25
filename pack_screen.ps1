@@ -5,7 +5,10 @@
 param(
   [string]$Path = "",
   [int]$MaxElements = 60,
-  [int]$MaxLines = 120
+  [int]$MaxLines = 120,
+  # 只看这个窗口的控件树。0 = 老行为，取当前前台窗口。
+  # 抓的是指定窗口时前台可能是别人，那就把别的窗口的控件一起报出去了。
+  [long]$WindowHandle = 0
 )
 
 Add-Type -AssemblyName UIAutomationClient
@@ -39,7 +42,7 @@ $out = [ordered]@{ ok = $true; at = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
 # ---- 一、窗口与控件 ----
 $swUia = [System.Diagnostics.Stopwatch]::StartNew()
 try {
-  $h = [Win32Probe]::GetForegroundWindow()
+  if ($WindowHandle -ne 0) { $h = [IntPtr]$WindowHandle } else { $h = [Win32Probe]::GetForegroundWindow() }
   $sb = New-Object System.Text.StringBuilder 512
   [void][Win32Probe]::GetWindowText($h, $sb, 512)
   $rect = New-Object Win32Probe+RECT

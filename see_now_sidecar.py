@@ -1230,7 +1230,7 @@ def _near(a: str, b: str) -> bool:
     return best >= 0.86
 
 
-def _text_layer(png: str, timeout: float = 8.0) -> dict:
+def _text_layer(png: str, timeout: float = 8.0, hwnd: int = 0) -> dict:
     """把屏幕编译成文字与坐标，摆在模型面前当文本读。
 
     两条腿都借自 Windows 自己：UI Automation 报控件树，Media.Ocr 抠字。
@@ -1241,10 +1241,15 @@ def _text_layer(png: str, timeout: float = 8.0) -> dict:
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pack_screen.ps1")
     if not os.path.exists(script):
         return {"ok": False, "error": "pack_screen.ps1 不在"}
+    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+           "-File", script, "-Path", png, "-MaxElements", "40", "-MaxLines", "80"]
+    if hwnd:
+        # 只让 UIA 报这一个窗口的控件。抓 app 档时前台可能是别的程序，
+        # 不问清楚就会把别人的控件树一起交出去。
+        cmd += ["-WindowHandle", str(int(hwnd))]
     try:
         proc = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-File", script, "-Path", png, "-MaxElements", "40", "-MaxLines", "80"],
+            cmd,
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -1736,7 +1741,7 @@ def run_once(cfg: dict) -> dict:
             origin = (int(crop_box[0]), int(crop_box[1]))
         try:
             ocr_src.save(src_png)
-            pack = _text_layer(src_png)
+            pack = _text_layer(src_png, hwnd=(_APP_HIT["hwnd"] if (_TARGET == "app" and _APP_HIT) else 0))
         finally:
             try:
                 os.remove(src_png)
